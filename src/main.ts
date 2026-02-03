@@ -16,7 +16,7 @@ const config = {
   backgroundColor: '#2a2a2a',
   platformColor: '#5a5a5a',
   obstacleColor: '#5a5a5a',   // Match Platform
-  poleColor: '#ff8800',       // Semi-transparent Orange
+  poleColor: '#0088ff',       // Blue
   particleColor: '#00e5ff',
   speed: 0.3,
   separationForce: 1.44,
@@ -328,8 +328,8 @@ const palette = [
   0xeeeeee, // Off-white
   0x111111, // Very Dark / Black
   0x222222, // Dark Grey
-  0xffd700, // Gold/Yellow
-  0xffcc00, // Amber
+  0xfffdd0, // Cream
+  0xf0e68c, // Khaki (Pale Yellow)
   0xf5f5dc  // Beige
 ]
 
@@ -551,29 +551,31 @@ function animate() {
     const minR = config.poleRadius + r1
     const maxR = config.platformRadius - r1
 
-    // 0. Static Obstacles 
-    for (let k = 0; k < config.obstacleCount; k++) {
-      const ox = obstacleData[k * 3]
-      const oz = obstacleData[k * 3 + 1]
-      const or = obstacleData[k * 3 + 2]
+    // 0. Static Obstacles (skip for leaving particles)
+    if (state !== STATE_LEAVING) {
+      for (let k = 0; k < config.obstacleCount; k++) {
+        const ox = obstacleData[k * 3]
+        const oz = obstacleData[k * 3 + 1]
+        const or = obstacleData[k * 3 + 2]
 
-      const dx = x - ox
-      const dz = z - oz
-      const dSq = dx * dx + dz * dz
+        const dx = x - ox
+        const dz = z - oz
+        const dSq = dx * dx + dz * dz
 
-      const minDist = r1 + or
-      if (dSq < minDist * minDist) {
-        const d = Math.sqrt(dSq)
-        const pen = minDist - d
-        const nx = dx / d
-        const nz = dz / d
+        const minDist = r1 + or
+        if (dSq < minDist * minDist) {
+          const d = Math.sqrt(dSq)
+          const pen = minDist - d
+          const nx = dx / d
+          const nz = dz / d
 
-        const pushFactor = 0.2
-        x += nx * pen * pushFactor
-        z += nz * pen * pushFactor
+          const pushFactor = 0.2
+          x += nx * pen * pushFactor
+          z += nz * pen * pushFactor
 
-        vx *= 0.5
-        vz *= 0.5
+          vx *= 0.5
+          vz *= 0.5
+        }
       }
     }
 
@@ -638,7 +640,7 @@ function animate() {
       }
     }
 
-    if (state !== STATE_ORBITING) {
+    if (state !== STATE_ORBITING && state !== STATE_LEAVING) {
       vx += sepX * config.separationForce * 0.05
       vz += sepZ * config.separationForce * 0.05
     }
@@ -689,8 +691,8 @@ function animate() {
       vz += steeringZ
 
       if (dist > 0.001) {
-        vx += (x / dist) * config.centrifugalForce * 0.1
-        vz += (z / dist) * config.centrifugalForce * 0.1
+        vx -= (x / dist) * config.centrifugalForce * 0.1
+        vz -= (z / dist) * config.centrifugalForce * 0.1
       }
 
       // Touch Check
@@ -708,8 +710,8 @@ function animate() {
         vz = tangZ * orbitSpeed
       }
 
-      // Boundaries
-      if (dist < minR && state === STATE_SEEKING) {
+      // Boundaries (only for seeking)
+      if (dist < minR) {
         const angle = Math.atan2(z, x)
         x = Math.cos(angle) * minR
         z = Math.sin(angle) * minR
@@ -731,6 +733,7 @@ function animate() {
       vx = tx * orbitSpeed
       vz = tz * orbitSpeed
 
+      // Maintain orbit radius
       const rErr = orbitRadius - dist
       const rx = x / dist
       const rz = z / dist
@@ -738,6 +741,7 @@ function animate() {
       x += rx * rErr * 0.1
       z += rz * rErr * 0.1
 
+      // Track angle traveled
       const angularVel = orbitSpeed / dist
       const dAngle = angularVel * dt
 
@@ -752,38 +756,48 @@ function animate() {
       _color.lerpColors(_baseColor, _targetColor, progress)
       headMesh.setColorAt(i, _color)
 
+      // Transition to leaving after one full orbit
       if (acc > Math.PI * 2) {
         state = STATE_LEAVING
         particles[i * STRIDE + 7] = STATE_LEAVING
+        // Reset velocity to purely radial (outward) direction
+        const radialSpeed = 0.08
+        vx = rx * radialSpeed
+        vz = rz * radialSpeed
       }
 
     } else if (state === STATE_LEAVING) {
-      // LEAVING BEHAVIOR
+      // LEAVING BEHAVIOR - drift away and fade out
       if (dist > 0.01) {
         const rx = x / dist
         const rz = z / dist
-        vx += rx * 0.02
-        vz += rz * 0.02
-        vx *= 0.98
-        vz *= 0.98
+        // Gentle outward acceleration for controlled drift
+        vx += rx * 0.05
+        vz += rz * 0.05
+        // Light friction for smooth drift
+        vx *= 0.99
+        vz *= 0.99
       }
 
-      // Shrink Effect
-      r1 *= 0.95
+      // Slow shrink effect so particles stay visible longer
+      r1 *= 0.985
       particles[i * STRIDE + 4] = r1
 
-      // Respawn if vanished
-      if (r1 < 0.001) {
+      // Respawn if vanished or drifted far away
+      if (r1 < 0.001 || dist > config.platformRadius * 1.8) {
         initParticle(i)
         continue
       }
     }
 
-    const speedLimit = config.speed * 1.5 * mySpeedMult
-    const currentVel = Math.sqrt(vx * vx + vz * vz)
-    if (currentVel > speedLimit) {
-      vx = (vx / currentVel) * speedLimit
-      vz = (vz / currentVel) * speedLimit
+    // Speed limit (but not for leaving particles - they need to escape!)
+    if (state !== STATE_LEAVING) {
+      const speedLimit = config.speed * 1.5 * mySpeedMult
+      const currentVel = Math.sqrt(vx * vx + vz * vz)
+      if (currentVel > speedLimit) {
+        vx = (vx / currentVel) * speedLimit
+        vz = (vz / currentVel) * speedLimit
+      }
     }
 
     x += vx * dt
@@ -793,6 +807,16 @@ function animate() {
     particles[i * STRIDE + 1] = z
     particles[i * STRIDE + 2] = vx
     particles[i * STRIDE + 3] = vz
+
+    // Universal respawn check - safety net for particles that escape boundaries
+    // (Leaving particles have their own respawn logic above)
+    if (state !== STATE_LEAVING) {
+      const currentDist = Math.sqrt(x * x + z * z)
+      if (currentDist > config.platformRadius * 1.05 || isNaN(x) || isNaN(z)) {
+        initParticle(i)
+        continue
+      }
+    }
 
     // Update Meshes (Size is restored to normal)
     const normalizedScale = r1 / (0.03 * 1.5)
