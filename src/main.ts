@@ -1015,35 +1015,56 @@ function animate() {
     z += vz * dt
 
     // Post-Integration Static Obstacles (Strict Constraint)
-    if (state !== STATE_LEAVING) {
-      for (let k = 0; k < config.obstacleCount; k++) {
-        const ox = obstacleData[k * 3]
-        const oz = obstacleData[k * 3 + 1]
-        // Radius Correction: Scale * (Base 1.0 + Bevel 0.1) + Buffer ~0.05
-        const or = obstacleData[k * 3 + 2] * 1.15
+    for (let k = 0; k < config.obstacleCount; k++) {
+      const ox = obstacleData[k * 3]
+      const oz = obstacleData[k * 3 + 1]
+      // Radius Correction: Scale * (Base 1.0 + Bevel 0.1) + Buffer ~0.05
+      const or = obstacleData[k * 3 + 2] * 1.15
 
-        const dx = x - ox
-        const dz = z - oz
-        const dSq = dx * dx + dz * dz
+      const dx = x - ox
+      const dz = z - oz
+      const dSq = dx * dx + dz * dz
 
-        const minDist = r1 + or
-        if (dSq < minDist * minDist) {
-          const d = Math.sqrt(dSq)
-          const pen = minDist - d
-          const nx = dx / d
-          const nz = dz / d
+      const minDist = r1 + or
+      if (dSq < minDist * minDist) {
+        const d = Math.sqrt(dSq)
+        const pen = minDist - d
+        const nx = dx / d
+        const nz = dz / d
 
-          // Hard resolve 100%
-          x += nx * pen
-          z += nz * pen
+        // Hard resolve 100%
+        x += nx * pen
+        z += nz * pen
 
-          // Deflect velocity
-          const vDotN = vx * nx + vz * nz
-          if (vDotN < 0) {
-            vx -= nx * vDotN
-            vz -= nz * vDotN
-          }
+        // Deflect velocity
+        const vDotN = vx * nx + vz * nz
+        if (vDotN < 0) {
+          vx -= nx * vDotN
+          vz -= nz * vDotN
         }
+      }
+    }
+
+    // Hard Central Pole Constraint (Solid Material)
+    const dPoleSq = x * x + z * z
+    const minPoleDist = config.poleRadius + r1
+    if (dPoleSq < minPoleDist * minPoleDist) {
+      const d = Math.sqrt(dPoleSq)
+      if (d > 0.0001) {
+        const nx = x / d
+        const nz = z / d
+        x = nx * minPoleDist
+        z = nz * minPoleDist
+        // Kill inward component
+        const vDotN = vx * nx + vz * nz
+        if (vDotN < 0) {
+          vx -= nx * vDotN
+          vz -= nz * vDotN
+        }
+      } else {
+        // Fallback for extreme center case
+        x = minPoleDist
+        z = 0
       }
     }
 
