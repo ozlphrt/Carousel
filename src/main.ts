@@ -20,6 +20,8 @@ const config = {
   particleColor: '#00e5ff',
   speed: 0.3,
   separationForce: 1.44,
+  alignmentForce: 0.5,
+  cohesionForce: 0.5,
   centrifugalForce: -0.2,
   vortexStrength: 0.0,
   poleOpacity: 0.343,
@@ -39,7 +41,7 @@ const MAX_PARTICLE_COUNT = 20000
 config.particleCount = 100
 
 // STRIDE 12 for extra state data
-// 0:x, 1:z, 2:vx, 3:vz, 4:r, 5:speedMult, 6:agility, 7:state, 8:accumAngle, 9:baseColor, 10:orbitRadius, 11:reserved
+// 0:x, 1:z, 2:vx, 3:vz, 4:r, 5:speedMult, 6:agility, 7:state, 8:accumAngle, 9:baseColor, 10:orbitRadius, 11:strengthMult
 const STRIDE = 12
 const particles = new Float32Array(MAX_PARTICLE_COUNT * STRIDE)
 
@@ -485,15 +487,12 @@ const dummy = new THREE.Object3D()
 const _color = new THREE.Color()
 const _targetColor = new THREE.Color()
 
-// Updated Palette: Black, Yellow, White tones
+// Updated Palette: Pure White, Yellow, Black, Red
 const palette = [
   0xffffff, // White
-  0xeeeeee, // Off-white
-  0x111111, // Very Dark / Black
-  0x222222, // Dark Grey
-  0xfffdd0, // Cream
-  0xf0e68c, // Khaki (Pale Yellow)
-  0xf5f5dc  // Beige
+  0xeeee00, // Yellow
+  0x111111, // Black
+  0xff0000  // Red
 ]
 
 const STATE_SEEKING = 0
@@ -511,9 +510,23 @@ function initParticle(i: number) {
   const x = Math.cos(angle) * startRadius
   const z = Math.sin(angle) * startRadius
 
-  // Traits
-  const speedMult = 0.7 + Math.random() * 0.6
-  const agilityMult = 0.5 + Math.random() * 1.0
+  // Traits based on Color (Strength)
+  const colorHex = palette[Math.floor(Math.random() * palette.length)]
+  let sMult = 1.0, aMult = 1.0, stMult = 1.0
+
+  if (colorHex === 0xffffff) { // White: Balanced
+    sMult = 1.0; aMult = 1.0; stMult = 1.0
+  } else if (colorHex === 0xeeee00) { // Yellow: Agile
+    sMult = 1.2; aMult = 1.5; stMult = 0.8
+  } else if (colorHex === 0x111111) { // Black: Strong
+    sMult = 0.7; aMult = 0.6; stMult = 2.0
+  } else if (colorHex === 0xff0000) { // Red: Aggressive
+    sMult = 1.4; aMult = 0.9; stMult = 1.3
+  }
+
+  const speedMult = (0.9 + Math.random() * 0.2) * sMult
+  const agilityMult = (0.9 + Math.random() * 0.2) * aMult
+  const strengthMult = stMult
 
   particles[i * STRIDE] = x
   particles[i * STRIDE + 1] = z
@@ -528,12 +541,13 @@ function initParticle(i: number) {
   particles[i * STRIDE + 6] = agilityMult
   particles[i * STRIDE + 7] = STATE_SEEKING
   particles[i * STRIDE + 8] = 0 // accumAngle
+  particles[i * STRIDE + 11] = strengthMult
 
   // Reset Trail for this particle
   resetTrail(i, x, 0.09 * scale, z)
 
-  const colorHex = palette[Math.floor(Math.random() * palette.length)]
-  particles[i * STRIDE + 9] = colorHex // Base color
+  const colorHex_assigned = colorHex // Already picked
+  particles[i * STRIDE + 9] = colorHex_assigned // Base color
 
   // Set positions
   updateParticleMesh(i, x, z, scale)
@@ -630,6 +644,8 @@ sceneFolder.add(config, 'bloomRadius', 0, 1).onChange((v: number) => bloomPass.r
 const physicsFolder = gui.addFolder('Physics')
 physicsFolder.add(config, 'speed', 0, 1)
 physicsFolder.add(config, 'separationForce', 0, 4)
+physicsFolder.add(config, 'alignmentForce', 0, 2).name('Alignment')
+physicsFolder.add(config, 'cohesionForce', 0, 2).name('Cohesion')
 physicsFolder.add(config, 'centrifugalForce', -0.3, 0.1).name('Centrifugal Force')
 physicsFolder.add(config, 'vortexStrength', 0, 2).name('Vortex Strength')
 physicsFolder.add(config, 'particleCount').name('Active Count').listen().disable()
@@ -831,6 +847,52 @@ function animate() {
     if (state !== STATE_ORBITING && state !== STATE_LEAVING) {
       vx += sepX * config.separationForce * 0.05
       vz += sepZ * config.separationForce * 0.05
+    }
+
+    // 2. Neighbor Boids (Alignment & Cohesion)
+    if (state === STATE_SEEKING) {
+      let alignX = 0, alignZ = 0, cohX = 0, cohZ = 0
+      let boidCount = 0
+
+      for (let r = row - 1; r <= row + 1; r++) {
+        for (let c = col - 1; c <= col + 1; c++) {
+          if (r >= 0 && r < dim && c >= 0 && c < dim) {
+            let j = gridHead[r * dim + c]
+            while (j !== -1) {
+              if (i !== j) {
+                const jx = particles[j * STRIDE], jz = particles[j * STRIDE + 1]
+                const jvx = particles[j * STRIDE + 2], jvz = particles[j * STRIDE + 3]
+                const dx = jx - x, dz = jz - z
+                const dSq = dx * dx + dz * dz
+
+                if (dSq < 0.5 * 0.5) { // Boid radius
+                  alignX += jvx; alignZ += jvz
+                  cohX += jx; cohZ += jz
+                  boidCount++
+                }
+              }
+              j = gridNext[j]
+            }
+          }
+        }
+      }
+
+      if (boidCount > 0) {
+        // Alignment
+        alignX /= boidCount; alignZ /= boidCount
+        const aLen = Math.sqrt(alignX * alignX + alignZ * alignZ)
+        if (aLen > 0) { alignX /= aLen; alignZ /= aLen }
+        vx += alignX * config.alignmentForce * myAgilityMult * 0.02
+        vz += alignZ * config.alignmentForce * myAgilityMult * 0.02
+
+        // Cohesion
+        cohX /= boidCount; cohZ /= boidCount
+        let cDx = cohX - x, cDz = cohZ - z
+        const cLen = Math.sqrt(cDx * cDx + cDz * cDz)
+        if (cLen > 0) { cDx /= cLen; cDz /= cLen }
+        vx += cDx * config.cohesionForce * myAgilityMult * 0.02
+        vz += cDz * config.cohesionForce * myAgilityMult * 0.02
+      }
     }
 
     // --- State Logic ---
@@ -1099,7 +1161,7 @@ function animate() {
     // Color Logic for Debug Mode
     // Color Logic: Red if Orbiting/Leaving, else Base Color
     if (state === STATE_ORBITING || state === STATE_LEAVING) {
-      _color.setHex(0xff0000) // RED
+      _color.setHex(0x00ffff) // NEON CYAN (Changed from Red to avoid conflict)
       bodyMesh.setColorAt(i, _color)
       headMesh.setColorAt(i, _color)
 
