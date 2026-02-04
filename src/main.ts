@@ -477,8 +477,6 @@ function updateSparks(dt: number) {
       // Gravity
       sparkVelocities[i * 3 + 1] -= 0.002
 
-      // Fade color
-      const fade = sparkLifetimes[i]
       sparkColors[i * 3] *= 0.98
       sparkColors[i * 3 + 1] *= 0.95
       // Keep blue channel for trail effect
@@ -644,14 +642,14 @@ const GROUP_WHITE = 1
 const GROUP_YELLOW = 2
 
 // Group Colors (distinct for clear visual only - no strength difference)
-const groupColors = {
+const groupColors: Record<number, number> = {
   [GROUP_BLACK]: 0x1a1a1a,   // Dark Black
   [GROUP_WHITE]: 0xf5f5f5,   // Off-White
   [GROUP_YELLOW]: 0xf5e6a3   // Pale Yellow / Cream
 }
 
 // Personal space multiplier per group (Physics improvement #3)
-const groupPersonalSpace = {
+const groupPersonalSpace: Record<number, number> = {
   [GROUP_BLACK]: 0.7,    // Tight clusters
   [GROUP_WHITE]: 1.0,    // Moderate spacing
   [GROUP_YELLOW]: 1.4    // Prefers more space
@@ -1092,8 +1090,6 @@ function animate() {
     const col = Math.floor((x + gridOffset) / cellSize)
     const row = Math.floor((z + gridOffset) / cellSize)
 
-    // Personal space affects soft threshold (Physics improvement #3)
-    const softThresholdFactor = 1.2 * myPersonalSpace
     const myGroup = particles[i * STRIDE + OFFSET.GROUP]
 
     const dist = Math.sqrt(x * x + z * z)
