@@ -4,7 +4,42 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js'
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
+import { BokehPass } from 'three/examples/jsm/postprocessing/BokehPass.js'
 import GUI from 'lil-gui'
+
+// --- Simple 2D Noise Implementation (Simplex-like) ---
+const NOISE_PERM = new Uint8Array(512)
+const NOISE_GRAD = [[1,1],[-1,1],[1,-1],[-1,-1],[1,0],[-1,0],[0,1],[0,-1]]
+for (let i = 0; i < 256; i++) NOISE_PERM[i] = i
+for (let i = 255; i > 0; i--) {
+  const j = Math.floor(Math.random() * (i + 1))
+  ;[NOISE_PERM[i], NOISE_PERM[j]] = [NOISE_PERM[j], NOISE_PERM[i]]
+}
+for (let i = 0; i < 256; i++) NOISE_PERM[i + 256] = NOISE_PERM[i]
+
+function noise2D(x: number, y: number): number {
+  const X = Math.floor(x) & 255
+  const Y = Math.floor(y) & 255
+  const xf = x - Math.floor(x)
+  const yf = y - Math.floor(y)
+  const u = xf * xf * (3 - 2 * xf)
+  const v = yf * yf * (3 - 2 * yf)
+  const aa = NOISE_PERM[NOISE_PERM[X] + Y]
+  const ab = NOISE_PERM[NOISE_PERM[X] + Y + 1]
+  const ba = NOISE_PERM[NOISE_PERM[X + 1] + Y]
+  const bb = NOISE_PERM[NOISE_PERM[X + 1] + Y + 1]
+  const gradAA = NOISE_GRAD[aa & 7]
+  const gradBA = NOISE_GRAD[ba & 7]
+  const gradAB = NOISE_GRAD[ab & 7]
+  const gradBB = NOISE_GRAD[bb & 7]
+  const n00 = gradAA[0] * xf + gradAA[1] * yf
+  const n10 = gradBA[0] * (xf - 1) + gradBA[1] * yf
+  const n01 = gradAB[0] * xf + gradAB[1] * (yf - 1)
+  const n11 = gradBB[0] * (xf - 1) + gradBB[1] * (yf - 1)
+  const nx0 = n00 * (1 - u) + n10 * u
+  const nx1 = n01 * (1 - u) + n11 * u
+  return nx0 * (1 - v) + nx1 * v
+}
 
 // --- Configuration ---
 const config = {
@@ -15,32 +50,52 @@ const config = {
   particleRadius: 0.08,
   backgroundColor: '#2a2a2a',
   platformColor: '#5a5a5a',
-  obstacleColor: '#5a5a5a',   // Match Platform
-  poleColor: '#0088ff',       // Blue
+  obstacleColor: '#5a5a5a',
+  poleColor: '#0088ff',
   particleColor: '#00e5ff',
-  speed: 0.3,
-  separationForce: 1.44,
-  centrifugalForce: -0.2,
-  vortexStrength: 0.0,
+  speed: 0.195,
+  separationForce: 0.288,
+  centrifugalForce: 0,  // Was -0.2 which pushed particles AWAY from pole
+  vortexStrength: 0,
   poleOpacity: 0.343,
   bloomStrength: 0.1398,
   bloomRadius: 0.5,
   bloomThreshold: 0,
   obstacleCount: 15,
   obstacleRadius: 0.3,
-  debugMode: false, // Toggle for debugging
+  debugMode: false,
   showTrails: false,
   trailLength: 30,
-  showPheromones: false
+  showPheromones: false,
+  // New visual settings
+  enableBobbing: true,
+  bobbingIntensity: 0.012,
+  enableDOF: false,
+  dofFocus: 5.0,
+  dofAperture: 0.002,
+  // New physics settings
+  densitySlowdown: 0.08,
+  alignmentForce: 0.02,
+  anticipationDistance: 0.5,
+  turbulenceStrength: 0.003,
+  orbitLayers: 4
 }
 
 // --- Global Data definitions ---
 const MAX_PARTICLE_COUNT = 20000
 config.particleCount = 100
 
-// STRIDE 12 for extra state data
-// 0:x, 1:z, 2:vx, 3:vz, 4:r, 5:speedMult, 6:agility, 7:state, 8:accumAngle, 9:baseColor, 10:orbitRadius, 11:reserved
-const STRIDE = 12
+// STRIDE 19 for extra state data
+// 0:x, 1:z, 2:vx, 3:vz, 4:r, 5:speedMult, 6:agility, 7:state, 8:accumAngle, 9:baseColor
+// 10:orbitRadius, 11:group, 12:mass, 13:personalSpace, 14:phase, 15:orbitLayer, 16:colorBlend, 17:wanderAngle
+// 18:leavingTime (how long in LEAVING state)
+const STRIDE = 19
+const OFFSET = {
+  X: 0, Z: 1, VX: 2, VZ: 3, RADIUS: 4, SPEED_MULT: 5, AGILITY: 6, STATE: 7,
+  ACCUM_ANGLE: 8, BASE_COLOR: 9, ORBIT_RADIUS: 10, GROUP: 11, MASS: 12,
+  PERSONAL_SPACE: 13, PHASE: 14, ORBIT_LAYER: 15, COLOR_BLEND: 16, WANDER_ANGLE: 17,
+  LEAVING_TIME: 18
+}
 const particles = new Float32Array(MAX_PARTICLE_COUNT * STRIDE)
 
 // Grid
@@ -99,7 +154,7 @@ for (let i = 0; i < trailPositions.length; i++) {
 }
 
 const trailMaterial = new THREE.LineBasicMaterial({
-  color: 0xff0000,
+  color: 0x88ff88,  // Soft green trail (visible against all groups)
   transparent: true,
   opacity: 0.5,
   blending: THREE.AdditiveBlending,
@@ -165,9 +220,18 @@ bloomPass.threshold = config.bloomThreshold
 bloomPass.strength = config.bloomStrength
 bloomPass.radius = config.bloomRadius
 
+// Depth of Field (Visual improvement #7)
+const bokehPass = new BokehPass(scene, camera, {
+  focus: config.dofFocus,
+  aperture: config.dofAperture,
+  maxblur: 0.01
+})
+bokehPass.enabled = config.enableDOF
+
 const composer = new EffectComposer(renderer)
 composer.addPass(renderScene)
 composer.addPass(bloomPass)
+composer.addPass(bokehPass)
 
 // --- Controls ---
 const controls = new OrbitControls(camera, canvas)
@@ -342,6 +406,94 @@ pole.castShadow = true
 pole.receiveShadow = true
 scene.add(pole)
 
+// Energy rings removed - were distracting
+
+// --- Pole Enhancement: Spark particles for when particles touch ---
+const SPARK_COUNT = 50
+const sparkGeometry = new THREE.BufferGeometry()
+const sparkPositions = new Float32Array(SPARK_COUNT * 3)
+const sparkVelocities = new Float32Array(SPARK_COUNT * 3)
+const sparkLifetimes = new Float32Array(SPARK_COUNT)
+const sparkColors = new Float32Array(SPARK_COUNT * 3)
+
+for (let i = 0; i < SPARK_COUNT; i++) {
+  sparkPositions[i * 3] = 99999  // Off-screen initially
+  sparkPositions[i * 3 + 1] = 99999
+  sparkPositions[i * 3 + 2] = 99999
+  sparkLifetimes[i] = 0
+}
+
+sparkGeometry.setAttribute('position', new THREE.BufferAttribute(sparkPositions, 3))
+sparkGeometry.setAttribute('color', new THREE.BufferAttribute(sparkColors, 3))
+
+const sparkMaterial = new THREE.PointsMaterial({
+  size: 0.08,
+  vertexColors: true,
+  transparent: true,
+  opacity: 0.9,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false
+})
+
+const sparkMesh = new THREE.Points(sparkGeometry, sparkMaterial)
+scene.add(sparkMesh)
+
+let nextSparkIndex = 0
+
+function emitSpark(x: number, z: number) {
+  const idx = nextSparkIndex
+  nextSparkIndex = (nextSparkIndex + 1) % SPARK_COUNT
+
+  sparkPositions[idx * 3] = x
+  sparkPositions[idx * 3 + 1] = 0.3 + Math.random() * 0.2
+  sparkPositions[idx * 3 + 2] = z
+
+  // Random upward/outward velocity
+  const angle = Math.atan2(z, x) + (Math.random() - 0.5) * 1.5
+  const speed = 0.02 + Math.random() * 0.03
+  sparkVelocities[idx * 3] = Math.cos(angle) * speed
+  sparkVelocities[idx * 3 + 1] = 0.03 + Math.random() * 0.02
+  sparkVelocities[idx * 3 + 2] = Math.sin(angle) * speed
+
+  sparkLifetimes[idx] = 1.0
+
+  // Color from pole color
+  const c = new THREE.Color(config.poleColor)
+  sparkColors[idx * 3] = c.r
+  sparkColors[idx * 3 + 1] = c.g
+  sparkColors[idx * 3 + 2] = c.b
+}
+
+function updateSparks(dt: number) {
+  for (let i = 0; i < SPARK_COUNT; i++) {
+    if (sparkLifetimes[i] > 0) {
+      sparkLifetimes[i] -= dt * 2
+
+      // Update position
+      sparkPositions[i * 3] += sparkVelocities[i * 3]
+      sparkPositions[i * 3 + 1] += sparkVelocities[i * 3 + 1]
+      sparkPositions[i * 3 + 2] += sparkVelocities[i * 3 + 2]
+
+      // Gravity
+      sparkVelocities[i * 3 + 1] -= 0.002
+
+      // Fade color
+      const fade = sparkLifetimes[i]
+      sparkColors[i * 3] *= 0.98
+      sparkColors[i * 3 + 1] *= 0.95
+      // Keep blue channel for trail effect
+
+      if (sparkLifetimes[i] <= 0) {
+        sparkPositions[i * 3] = 99999
+        sparkPositions[i * 3 + 1] = 99999
+        sparkPositions[i * 3 + 2] = 99999
+      }
+    }
+  }
+  sparkGeometry.attributes.position.needsUpdate = true
+  sparkGeometry.attributes.color.needsUpdate = true
+}
+
 // --- Composite Particle Geometry (Capsule Body + Head Shell) ---
 const bodyGeometry = new THREE.CapsuleGeometry(0.03, 0.12, 4, 8)
 const headGeometry = new THREE.SphereGeometry(0.031, 8, 8)
@@ -485,22 +637,51 @@ const dummy = new THREE.Object3D()
 const _color = new THREE.Color()
 const _targetColor = new THREE.Color()
 
-// Updated Palette: Black, Yellow, White tones
-const palette = [
-  0xffffff, // White
-  0xeeeeee, // Off-white
-  0x111111, // Very Dark / Black
-  0x222222, // Dark Grey
-  0xfffdd0, // Cream
-  0xf0e68c, // Khaki (Pale Yellow)
-  0xf5f5dc  // Beige
-]
+// --- Group System: Black, White, Yellow ---
+// Group IDs
+const GROUP_BLACK = 0
+const GROUP_WHITE = 1
+const GROUP_YELLOW = 2
+
+// Group Colors (distinct for clear visual only - no strength difference)
+const groupColors = {
+  [GROUP_BLACK]: 0x1a1a1a,   // Dark Black
+  [GROUP_WHITE]: 0xf5f5f5,   // Off-White
+  [GROUP_YELLOW]: 0xf5e6a3   // Pale Yellow / Cream
+}
+
+// Personal space multiplier per group (Physics improvement #3)
+const groupPersonalSpace = {
+  [GROUP_BLACK]: 0.7,    // Tight clusters
+  [GROUP_WHITE]: 1.0,    // Moderate spacing
+  [GROUP_YELLOW]: 1.4    // Prefers more space
+}
+
+// Attraction config - SECONDARY to pole-seeking behavior
+const attractionConfig = {
+  attractionRadius: 1.0565,
+  attractionForce: 0.0135,
+  groupAffinityBonus: 1.439,
+  crossGroupAttraction: 0
+}
 
 const STATE_SEEKING = 0
 const STATE_ORBITING = 1
 const STATE_LEAVING = 2
 
 function initParticle(i: number) {
+  // Assign group: roughly equal distribution (visual only, no strength difference)
+  const groupRoll = Math.random()
+  let group: number
+  if (groupRoll < 0.33) {
+    group = GROUP_BLACK
+  } else if (groupRoll < 0.66) {
+    group = GROUP_WHITE
+  } else {
+    group = GROUP_YELLOW
+  }
+
+  // All particles have equal base properties
   const scale = 0.9 + Math.random() * 0.2
   const pRadius = 0.03 * scale * 1.5
 
@@ -511,32 +692,43 @@ function initParticle(i: number) {
   const x = Math.cos(angle) * startRadius
   const z = Math.sin(angle) * startRadius
 
-  // Traits
+  // Traits - same for all groups
   const speedMult = 0.7 + Math.random() * 0.6
   const agilityMult = 0.5 + Math.random() * 1.0
 
-  particles[i * STRIDE] = x
-  particles[i * STRIDE + 1] = z
+  particles[i * STRIDE + OFFSET.X] = x
+  particles[i * STRIDE + OFFSET.Z] = z
 
   // Rush Inwards
   const speed = (config.speed * 1.5) * speedMult
-  particles[i * STRIDE + 2] = -Math.cos(angle) * speed
-  particles[i * STRIDE + 3] = -Math.sin(angle) * speed
+  particles[i * STRIDE + OFFSET.VX] = -Math.cos(angle) * speed
+  particles[i * STRIDE + OFFSET.VZ] = -Math.sin(angle) * speed
 
-  particles[i * STRIDE + 4] = pRadius
-  particles[i * STRIDE + 5] = speedMult
-  particles[i * STRIDE + 6] = agilityMult
-  particles[i * STRIDE + 7] = STATE_SEEKING
-  particles[i * STRIDE + 8] = 0 // accumAngle
+  particles[i * STRIDE + OFFSET.RADIUS] = pRadius
+  particles[i * STRIDE + OFFSET.SPEED_MULT] = speedMult
+  particles[i * STRIDE + OFFSET.AGILITY] = agilityMult
+  particles[i * STRIDE + OFFSET.STATE] = STATE_SEEKING
+  particles[i * STRIDE + OFFSET.ACCUM_ANGLE] = 0
 
   // Reset Trail for this particle
   resetTrail(i, x, 0.09 * scale, z)
 
-  const colorHex = palette[Math.floor(Math.random() * palette.length)]
-  particles[i * STRIDE + 9] = colorHex // Base color
+  // Set color based on group
+  const colorHex = groupColors[group]
+  particles[i * STRIDE + OFFSET.BASE_COLOR] = colorHex
+  particles[i * STRIDE + OFFSET.GROUP] = group
 
-  // Set positions
-  updateParticleMesh(i, x, z, scale)
+  // New fields for physics/visual improvements
+  particles[i * STRIDE + OFFSET.MASS] = 0.7 + Math.random() * 0.6  // Mass for momentum/inertia
+  particles[i * STRIDE + OFFSET.PERSONAL_SPACE] = groupPersonalSpace[group]  // Group-based spacing
+  particles[i * STRIDE + OFFSET.PHASE] = Math.random() * Math.PI * 2  // Phase for bobbing animation
+  particles[i * STRIDE + OFFSET.ORBIT_LAYER] = -1  // Will be assigned when orbiting
+  particles[i * STRIDE + OFFSET.COLOR_BLEND] = 0  // 0 = original color, 1 = fully red
+  particles[i * STRIDE + OFFSET.WANDER_ANGLE] = Math.random() * Math.PI * 2  // For leaving behavior
+  particles[i * STRIDE + OFFSET.LEAVING_TIME] = 0  // Time spent in LEAVING state
+
+  // Set positions with initial rotation (facing inward)
+  updateParticleMesh(i, x, z, scale, -Math.cos(angle), -Math.sin(angle))
 
   // Color: Applies to BOTH Body and Head initially
   _color.setHex(colorHex)
@@ -544,17 +736,27 @@ function initParticle(i: number) {
   bodyMesh.setColorAt(i, _color)
 }
 
-function updateParticleMesh(i: number, x: number, z: number, scale: number) {
-  // Body (Capsule) - pivot is center.
-  // Center Y = 0.09 * scale
-  dummy.position.set(x, 0.09 * scale, z)
-  dummy.scale.set(scale, scale, scale)
+function updateParticleMesh(i: number, x: number, z: number, scale: number, vx: number = 0, vz: number = 0, bobOffset: number = 0, scaleMultiplier: number = 1.0) {
+  // Calculate rotation to face movement direction (Visual improvement #1)
+  const speed = Math.sqrt(vx * vx + vz * vz)
+  let rotationY = 0
+  if (speed > 0.001) {
+    rotationY = Math.atan2(vx, vz)  // Face velocity direction
+  }
+
+  const finalScale = scale * scaleMultiplier
+
+  // Body (Capsule) - pivot is center with bobbing offset
+  dummy.position.set(x, 0.09 * finalScale + bobOffset, z)
+  dummy.rotation.set(0, rotationY, 0)
+  dummy.scale.set(finalScale, finalScale, finalScale)
   dummy.updateMatrix()
   bodyMesh.setMatrixAt(i, dummy.matrix)
 
   // Head (Sphere overlay) - Offset Y = 0.06 (half height of cylinder straight part)
-  dummy.position.set(x, (0.09 + 0.06) * scale, z)
-  dummy.scale.set(scale, scale, scale)
+  dummy.position.set(x, (0.09 + 0.06) * finalScale + bobOffset, z)
+  dummy.rotation.set(0, rotationY, 0)
+  dummy.scale.set(finalScale, finalScale, finalScale)
   dummy.updateMatrix()
   headMesh.setMatrixAt(i, dummy.matrix)
 }
@@ -577,8 +779,8 @@ function updateGrid() {
   gridHead.fill(-1, 0, dim * dim)
 
   for (let i = 0; i < config.particleCount; i++) {
-    const x = particles[i * STRIDE]
-    const z = particles[i * STRIDE + 1]
+    const x = particles[i * STRIDE + OFFSET.X]
+    const z = particles[i * STRIDE + OFFSET.Z]
 
     if (isNaN(x) || isNaN(z)) continue;
 
@@ -634,6 +836,33 @@ physicsFolder.add(config, 'centrifugalForce', -0.3, 0.1).name('Centrifugal Force
 physicsFolder.add(config, 'vortexStrength', 0, 2).name('Vortex Strength')
 physicsFolder.add(config, 'particleCount').name('Active Count').listen().disable()
 
+// Group Attraction Controls (secondary to pole-seeking)
+const groupFolder = gui.addFolder('Group Behavior')
+groupFolder.add(attractionConfig, 'attractionForce', 0, 0.02).name('Attraction (subtle)')
+groupFolder.add(attractionConfig, 'attractionRadius', 0.5, 4).name('Attraction Range')
+groupFolder.add(attractionConfig, 'groupAffinityBonus', 0.5, 2).name('Same-Group Bond')
+groupFolder.add(attractionConfig, 'crossGroupAttraction', 0, 2).name('Cross-Group Pull')
+
+// New Visual Controls
+const visualFolder = gui.addFolder('Visual Effects')
+visualFolder.add(config, 'enableBobbing').name('Walking Bobbing')
+visualFolder.add(config, 'bobbingIntensity', 0, 0.03).name('Bob Intensity')
+visualFolder.add(config, 'enableDOF').name('Depth of Field').onChange((v: boolean) => bokehPass.enabled = v)
+visualFolder.add(config, 'dofFocus', 1, 15).name('DOF Focus').onChange((v: number) => {
+  (bokehPass.uniforms as any)['focus'].value = v
+})
+visualFolder.add(config, 'dofAperture', 0, 0.01).name('DOF Aperture').onChange((v: number) => {
+  (bokehPass.uniforms as any)['aperture'].value = v
+})
+
+// New Physics Controls
+const advPhysicsFolder = gui.addFolder('Advanced Physics')
+advPhysicsFolder.add(config, 'densitySlowdown', 0, 0.2).name('Density Slowdown')
+advPhysicsFolder.add(config, 'alignmentForce', 0, 0.1).name('Lane Alignment')
+advPhysicsFolder.add(config, 'anticipationDistance', 0, 1.5).name('Avoidance Lookahead')
+advPhysicsFolder.add(config, 'turbulenceStrength', 0, 0.01).name('Turbulence')
+advPhysicsFolder.add(config, 'orbitLayers', 1, 8, 1).name('Orbit Layers')
+
 // Debug Mode Logic
 const debugLabels: THREE.Sprite[] = []
 const labelTextureCache: { [key: number]: THREE.Texture } = {}
@@ -663,7 +892,7 @@ function updateDebugMode() {
     // Reinforce limits
     for (let i = 100; i < MAX_PARTICLE_COUNT; i++) {
       // Reset state for unused particles just in case
-      particles[i * STRIDE + 7] = STATE_SEEKING
+      particles[i * STRIDE + OFFSET.STATE] = STATE_SEEKING
     }
   } else {
     // Clear labels
@@ -673,6 +902,62 @@ function updateDebugMode() {
 }
 
 gui.add(config, 'debugMode').name('Debug Mode (100 Ppl)').onChange(updateDebugMode)
+
+// Reset button - clear all and start from scratch
+const resetSimulation = () => {
+  // Reset particle count to zero
+  config.particleCount = 0
+  bodyMesh.count = 0
+  headMesh.count = 0
+  
+  // Clear all trail data
+  for (let i = 0; i < trailHistory.length; i++) {
+    trailHistory[i] = 99999
+  }
+  for (let i = 0; i < trailPositions.length; i++) {
+    trailPositions[i] = 99999
+  }
+  trailHeads.fill(0)
+  
+  // Clear debug labels
+  debugLabels.forEach(label => {
+    if (label) label.visible = false
+  })
+  
+  bodyMesh.instanceMatrix.needsUpdate = true
+  headMesh.instanceMatrix.needsUpdate = true
+}
+gui.add({ reset: resetSimulation }, 'reset').name('Reset (Clear All)')
+
+// Restart button - keep existing people but send them back to edge
+const restartSimulation = () => {
+  const currentCount = config.particleCount
+  
+  // Reinitialize all existing particles (sends them back to edge)
+  for (let i = 0; i < currentCount; i++) {
+    initParticle(i)
+  }
+  
+  // Clear trails
+  for (let i = 0; i < trailHistory.length; i++) {
+    trailHistory[i] = 99999
+  }
+  for (let i = 0; i < trailPositions.length; i++) {
+    trailPositions[i] = 99999
+  }
+  trailHeads.fill(0)
+  
+  // Clear debug labels
+  debugLabels.forEach(label => {
+    if (label) label.visible = false
+  })
+  
+  bodyMesh.instanceMatrix.needsUpdate = true
+  bodyMesh.instanceColor!.needsUpdate = true
+  headMesh.instanceMatrix.needsUpdate = true
+  headMesh.instanceColor!.needsUpdate = true
+}
+gui.add({ restart: restartSimulation }, 'restart').name('Restart (Keep People)')
 
 gui.domElement.style.display = 'none'
 
@@ -707,8 +992,17 @@ window.addEventListener('resize', () => {
 // --- Animation Loop ---
 const TARGET_POPULATION = 15000
 
+// Track orbit layer assignments for concentric ring effect
+const orbitLayerCounts = new Int32Array(10) // Max 10 layers
+
+// Color interpolation helpers
+const _baseColor = new THREE.Color()
+const _orangeColor = new THREE.Color(0xff6600)
+const _redColor = new THREE.Color(0xff0000)
+
 function animate() {
   const now = performance.now()
+  const globalTime = now * 0.001 // Seconds for animations
   frames++
   if (now - lastFpsUpdate >= 500) {
     const fps = Math.round((frames * 1000) / (now - lastFpsUpdate))
@@ -723,7 +1017,6 @@ function animate() {
     const startIdx = config.particleCount
     const endIdx = Math.min(startIdx + spawnRate, TARGET_POPULATION)
 
-    // DEBUG MODE: Prevent spawning beyond 100
     if (!config.debugMode || config.particleCount < 100) {
       for (let i = startIdx; i < endIdx; i++) {
         if (config.debugMode && i >= 100) break;
@@ -745,37 +1038,67 @@ function animate() {
   }
 
   controls.update()
-  updateGrid() // Updates gridHead
+  updateGrid()
 
   const dt = 0.016
   const dim = GRID_DIM
 
+  // Energy rings animation removed
+
+  // Update pole light pulsing based on orbit activity
+  let orbitingCount = 0
+  for (let i = 0; i < config.particleCount; i++) {
+    if (particles[i * STRIDE + OFFSET.STATE] === STATE_ORBITING) orbitingCount++
+  }
+  const pulseIntensity = 5 + Math.sin(globalTime * 3) * 2 + orbitingCount * 0.01
+  poleLight.intensity = Math.min(pulseIntensity, 15)
+
+  // Update sparks
+  updateSparks(dt)
+
   _targetColor.set(config.poleColor)
 
   for (let i = 0; i < config.particleCount; i++) {
-    // Current State
-    let x = particles[i * STRIDE]
-    let z = particles[i * STRIDE + 1]
-    let vx = particles[i * STRIDE + 2]
-    let vz = particles[i * STRIDE + 3]
-    let r1 = particles[i * STRIDE + 4] // allow modifying radii
-    const mySpeedMult = particles[i * STRIDE + 5]
-    const myAgilityMult = particles[i * STRIDE + 6]
-    let state = particles[i * STRIDE + 7]
+    // Current State using OFFSET constants
+    let x = particles[i * STRIDE + OFFSET.X]
+    let z = particles[i * STRIDE + OFFSET.Z]
+    let vx = particles[i * STRIDE + OFFSET.VX]
+    let vz = particles[i * STRIDE + OFFSET.VZ]
+    let r1 = particles[i * STRIDE + OFFSET.RADIUS]
+    const mySpeedMult = particles[i * STRIDE + OFFSET.SPEED_MULT]
+    const myAgilityMult = particles[i * STRIDE + OFFSET.AGILITY]
+    let state = particles[i * STRIDE + OFFSET.STATE]
+    const myMass = particles[i * STRIDE + OFFSET.MASS]
+    const myPersonalSpace = particles[i * STRIDE + OFFSET.PERSONAL_SPACE]
+    const myPhase = particles[i * STRIDE + OFFSET.PHASE]
+    let colorBlend = particles[i * STRIDE + OFFSET.COLOR_BLEND]
+    let wanderAngle = particles[i * STRIDE + OFFSET.WANDER_ANGLE]
 
     const minR = config.poleRadius + r1
     const maxR = config.platformRadius - r1
 
-
-    // 1. Neighbor Physics
+    // 1. Neighbor Physics with improved features
     let sepX = 0
     let sepZ = 0
+    let attrX = 0
+    let attrZ = 0
     let localDensity = 0
+    
+    // Lane alignment: track average velocity of nearby same-direction particles
+    let alignVx = 0
+    let alignVz = 0
+    let alignCount = 0
 
     const col = Math.floor((x + gridOffset) / cellSize)
     const row = Math.floor((z + gridOffset) / cellSize)
 
-    const softThresholdFactor = 1.2
+    // Personal space affects soft threshold (Physics improvement #3)
+    const softThresholdFactor = 1.2 * myPersonalSpace
+    const myGroup = particles[i * STRIDE + OFFSET.GROUP]
+
+    const dist = Math.sqrt(x * x + z * z)
+    const toPoleX = -x / (dist + 0.001)
+    const toPoleZ = -z / (dist + 0.001)
 
     // Check neighbors 3x3
     for (let r = row - 1; r <= row + 1; r++) {
@@ -786,39 +1109,125 @@ function animate() {
 
           while (j !== -1) {
             if (i !== j) {
-              const jx = particles[j * STRIDE]
-              const jz = particles[j * STRIDE + 1]
-              const r2 = particles[j * STRIDE + 4]
+              const jx = particles[j * STRIDE + OFFSET.X]
+              const jz = particles[j * STRIDE + OFFSET.Z]
+              const jvx = particles[j * STRIDE + OFFSET.VX]
+              const jvz = particles[j * STRIDE + OFFSET.VZ]
+              const r2 = particles[j * STRIDE + OFFSET.RADIUS]
+              const otherGroup = particles[j * STRIDE + OFFSET.GROUP]
+              const otherPersonalSpace = particles[j * STRIDE + OFFSET.PERSONAL_SPACE]
+              const otherState = particles[j * STRIDE + OFFSET.STATE]
 
               const dx = x - jx
               const dz = z - jz
               const dSq = dx * dx + dz * dz
 
               const combinedRadius = r1 + r2
-              const softRadius = combinedRadius * softThresholdFactor
+              // Average personal space for combined soft radius
+              const avgPersonalSpace = (myPersonalSpace + otherPersonalSpace) * 0.5
+              const softRadius = combinedRadius * 1.2 * avgPersonalSpace
+
+              // If we are LEAVING, we ignore crowd physics entirely (ghost through)
+              if (state === STATE_LEAVING) {
+                j = gridNext[j]
+                continue
+              }
+
+              // --- ANTICIPATORY AVOIDANCE (Physics improvement #4) ---
+              if (config.anticipationDistance > 0) {
+                const futureX = x + vx * config.anticipationDistance * 10
+                const futureZ = z + vz * config.anticipationDistance * 10
+                const futureJX = jx + jvx * config.anticipationDistance * 10
+                const futureJZ = jz + jvz * config.anticipationDistance * 10
+                const futureDx = futureX - futureJX
+                const futureDz = futureZ - futureJZ
+                const futureDSq = futureDx * futureDx + futureDz * futureDz
+                
+                if (futureDSq < softRadius * softRadius && futureDSq > 0.01) {
+                  const futureD = Math.sqrt(futureDSq)
+                  const avoidForce = (softRadius - futureD) / futureD * 0.3
+                  sepX += (futureDx / futureD) * avoidForce
+                  sepZ += (futureDz / futureD) * avoidForce
+                }
+              }
+
+              // --- LANE ALIGNMENT (Physics improvement #2) ---
+              // Only align with particles moving in similar direction
+              if (dSq < attractionConfig.attractionRadius * attractionConfig.attractionRadius) {
+                const mySpeed = Math.sqrt(vx * vx + vz * vz)
+                const otherSpeed = Math.sqrt(jvx * jvx + jvz * jvz)
+                if (mySpeed > 0.01 && otherSpeed > 0.01) {
+                  const dotVel = (vx * jvx + vz * jvz) / (mySpeed * otherSpeed)
+                  if (dotVel > 0.5) { // Similar direction
+                    alignVx += jvx
+                    alignVz += jvz
+                    alignCount++
+                  }
+                }
+              }
+
+              // --- ATTRACTION FORCE ---
+              const attrRadiusSq = attractionConfig.attractionRadius * attractionConfig.attractionRadius
+              if (dSq > softRadius * softRadius && dSq < attrRadiusSq) {
+                const invD = 1.0 / Math.sqrt(dSq)
+                const nx = dx * invD
+                const nz = dz * invD
+                const dotWithPole = -nx * toPoleX + -nz * toPoleZ
+
+                if (dotWithPole > -0.3) {
+                  const affinityMult = (myGroup === otherGroup) 
+                    ? attractionConfig.groupAffinityBonus 
+                    : attractionConfig.crossGroupAttraction
+                  const poleAlignBonus = (dotWithPole + 0.3) * 0.77
+                  const distFactor = 1.0 - Math.sqrt(dSq) * (1.0 / attractionConfig.attractionRadius)
+                  const attrForce = attractionConfig.attractionForce * affinityMult * distFactor * poleAlignBonus
+                  attrX -= nx * attrForce
+                  attrZ -= nz * attrForce
+                }
+              }
 
               // Density check
               if (dSq < softRadius * softRadius * 1.5) {
                 localDensity++
               }
 
+              // --- COLLISION ---
+              const isLeaving = (state === STATE_LEAVING)
+              const otherIsLeaving = (otherState === STATE_LEAVING)
+              
+              // Leaving particles reduce collision response as urgency increases
+              let collisionMult = 1.0
+              if (isLeaving) {
+                const myLeavingTime = particles[i * STRIDE + OFFSET.LEAVING_TIME]
+                const urgencyPhase = myLeavingTime / 4.0
+                // Collision reduction scales with urgency: 1.0 -> 0.4 -> 0.2
+                collisionMult = Math.max(0.2, 1.0 - urgencyPhase * 0.4)
+              }
+
+              // Seekers yield to leavers to prevent crowd-lock
+              if (!isLeaving && otherIsLeaving && dSq < softRadius * softRadius * 2) {
+                const d = Math.sqrt(dSq)
+                const avoidNx = dx / d
+                const avoidNz = dz / d
+                sepX += avoidNx * 0.4
+                sepZ += avoidNz * 0.4
+              }
+              
               if (dSq > 0 && dSq < softRadius * softRadius) {
                 const d = Math.sqrt(dSq)
                 const nx = dx / d
                 const nz = dz / d
 
-                // Rigid overlap
                 if (d < combinedRadius) {
                   const overlap = combinedRadius - d
-                  const push = overlap * 0.45 // Slightly softened from 0.5
-                  const pushMult = (state === STATE_ORBITING) ? 0.15 : 0.4 // Softened
+                  const push = overlap * 0.45 * collisionMult
+                  const pushMult = (state === STATE_ORBITING) ? 0.15 : 0.4
                   x += nx * push * pushMult
                   z += nz * push * pushMult
                 }
 
-                // Separation
-                const force = (softRadius - d) / d
-                sepX += nx * force * 0.8 // Smoother separation
+                const force = (softRadius - d) / d * collisionMult
+                sepX += nx * force * 0.8
                 sepZ += nz * force * 0.8
               }
             }
@@ -828,24 +1237,50 @@ function animate() {
       }
     }
 
+    // --- DENSITY SLOWDOWN (Physics improvement #1) ---
+    const densityFactor = Math.max(0.3, 1.0 - localDensity * config.densitySlowdown)
+
+    // --- TURBULENCE/NOISE (Physics improvement #7) ---
+    let turbX = 0
+    let turbZ = 0
+    if (config.turbulenceStrength > 0) {
+      turbX = noise2D(x * 0.3 + globalTime * 0.5, z * 0.3) * config.turbulenceStrength
+      turbZ = noise2D(x * 0.3, z * 0.3 + globalTime * 0.5) * config.turbulenceStrength
+    }
+
+    // Apply forces with mass-based inertia (Physics improvement #5)
+    const massInertia = 1.0 / myMass
+
     if (state !== STATE_ORBITING && state !== STATE_LEAVING) {
-      vx += sepX * config.separationForce * 0.05
-      vz += sepZ * config.separationForce * 0.05
+      vx += sepX * config.separationForce * 0.05 * massInertia
+      vz += sepZ * config.separationForce * 0.05 * massInertia
+      
+      const poleProximityFactor = Math.min(1.0, (dist - config.poleRadius) / 3.0)
+      vx += attrX * poleProximityFactor * massInertia
+      vz += attrZ * poleProximityFactor * massInertia
+
+      // Apply lane alignment (Physics improvement #2)
+      if (alignCount > 0 && config.alignmentForce > 0) {
+        alignVx /= alignCount
+        alignVz /= alignCount
+        vx += (alignVx - vx) * config.alignmentForce * massInertia
+        vz += (alignVz - vz) * config.alignmentForce * massInertia
+      }
+
+      // Apply turbulence
+      vx += turbX * massInertia
+      vz += turbZ * massInertia
     }
 
     // --- State Logic ---
-    const dist = Math.sqrt(x * x + z * z)
-
     if (state === STATE_SEEKING) {
-      // SEEKING BEHAVIOR
       const rx = -x / dist
       const rz = -z / dist
       const tx = -z / dist
       const tz = x / dist
 
-      // Dynamic Flow - only spiral when very close to pole
       let spiralDesire = 0.0
-      if (dist < 1.2) spiralDesire = 1.0  // Reduced from 2.5 to allow particles to reach pole
+      if (dist < 1.2) spiralDesire = 1.0
       if (localDensity > 2) spiralDesire = Math.max(spiralDesire, Math.min(1.0, (localDensity - 2) * 0.3))
 
       let dx = tx * spiralDesire + rx * (1.0 - spiralDesire * 0.5)
@@ -854,10 +1289,9 @@ function animate() {
       const len = Math.sqrt(dx * dx + dz * dz)
       if (len > 0) { dx /= len; dz /= len; }
 
-      let speedFactor = 1.0
+      let speedFactor = densityFactor // Apply density slowdown
       if (dist > 0.1 && dist < 5.0) {
-        speedFactor = 1.0 + config.vortexStrength * (5.0 / dist - 1.0)
-        // Add "Excitement": Speed increases as they get closer to the pole
+        speedFactor *= 1.0 + config.vortexStrength * (5.0 / dist - 1.0)
         const proximityExcitement = Math.max(0, 1.0 - (dist - config.poleRadius) / 5.0)
         speedFactor *= (1.0 + proximityExcitement * 0.8)
         speedFactor = Math.max(0.1, Math.min(speedFactor, 4.0))
@@ -867,14 +1301,13 @@ function animate() {
       const desiredVx = dx * currentSpeed
       const desiredVz = dz * currentSpeed
 
-      // Steering Excitement: agility increase as they get closer
       const proximityExcitement = Math.max(0, 1.0 - (dist - config.poleRadius) / 3.0)
       const dynamicAgility = myAgilityMult * (1.0 + proximityExcitement * 2.0)
 
-      // Steering
+      // Steering with mass-based inertia
       let steeringX = desiredVx - vx
       let steeringZ = desiredVz - vz
-      const maxSteer = 0.05 * dynamicAgility // Increased based on proximity
+      const maxSteer = 0.05 * dynamicAgility * massInertia
 
       const steerLen = Math.sqrt(steeringX * steeringX + steeringZ * steeringZ)
       if (steerLen > maxSteer) {
@@ -882,57 +1315,67 @@ function animate() {
         steeringZ = (steeringZ / steerLen) * maxSteer
       }
 
-      vx += steeringX * 0.8 // Slightly dampened steering to reduce jitter
+      vx += steeringX * 0.8
       vz += steeringZ * 0.8
 
       if (dist > 0.001) {
-        vx -= (x / dist) * config.centrifugalForce * 0.05 // Reduced from 0.1
+        vx -= (x / dist) * config.centrifugalForce * 0.05
         vz -= (z / dist) * config.centrifugalForce * 0.05
       }
 
-      // Touch Check - particles must actually touch the pole to start orbiting
+      // Touch Check - start orbiting and assign layer
       if (dist < config.poleRadius + r1) {
         state = STATE_ORBITING
-        particles[i * STRIDE + 7] = STATE_ORBITING
-        particles[i * STRIDE + 8] = 0 // Reset angle accumulator
-        particles[i * STRIDE + 10] = dist // Store orbit radius
+        particles[i * STRIDE + OFFSET.STATE] = STATE_ORBITING
+        particles[i * STRIDE + OFFSET.ACCUM_ANGLE] = 0
+        
+        // Assign orbit layer (Physics improvement #6)
+        let assignedLayer = 0
+        const layerSpacing = r1 * 2.5
+        for (let layer = 0; layer < config.orbitLayers; layer++) {
+          if (orbitLayerCounts[layer] < (layer + 1) * 15) { // More particles in outer layers
+            assignedLayer = layer
+            orbitLayerCounts[layer]++
+            break
+          }
+        }
+        particles[i * STRIDE + OFFSET.ORBIT_LAYER] = assignedLayer
+        const orbitRadius = config.poleRadius + r1 + assignedLayer * layerSpacing
+        particles[i * STRIDE + OFFSET.ORBIT_RADIUS] = orbitRadius
 
         const orbitSpeed = config.speed
         const tangX = -z / dist
         const tangZ = x / dist
-
         vx = tangX * orbitSpeed
         vz = tangZ * orbitSpeed
+
+        // Emit sparks when touching pole! (Visual improvement #6)
+        for (let s = 0; s < 3; s++) {
+          emitSpark(x, z)
+        }
       }
 
-      // Inner boundary only - prevent particles from going through the pole
+      // Boundaries
       if (dist < minR) {
         const angle = Math.atan2(z, x)
         x = Math.cos(angle) * minR
         z = Math.sin(angle) * minR
       }
 
-      // Outer boundary - prevent particles from leaving the platform
       if (dist > maxR) {
         const angle = Math.atan2(z, x)
         x = Math.cos(angle) * maxR
         z = Math.sin(angle) * maxR
-
-        // If moving outward, cancel that component and push inward STRONGLY
         const rx = x / dist
         const rz = z / dist
         const vDotR = vx * rx + vz * rz
-
         if (vDotR > 0) {
-          vx -= rx * vDotR // Kill outward velocity
+          vx -= rx * vDotR
           vz -= rz * vDotR
-
-          // Stronger inward bounce to overcome separation forces
           vx -= rx * 0.05
           vz -= rz * 0.05
         }
       } else if (dist > config.platformRadius * 0.9) {
-        // Soft Edge Repulsion: If very close to edge, add extra inward desire
         const rx = x / dist
         const rz = z / dist
         vx -= rx * 0.01
@@ -940,13 +1383,11 @@ function animate() {
       }
 
     } else if (state === STATE_ORBITING) {
-      // ORBITING BEHAVIOR
-      const orbitRadius = particles[i * STRIDE + 10]
+      const orbitRadius = particles[i * STRIDE + OFFSET.ORBIT_RADIUS]
       const orbitSpeed = config.speed * 1.5
 
       const tx = -z / dist
       const tz = x / dist
-
       vx = tx * orbitSpeed
       vz = tz * orbitSpeed
 
@@ -954,54 +1395,124 @@ function animate() {
       const rErr = orbitRadius - dist
       const rx = x / dist
       const rz = z / dist
-
       x += rx * rErr * 0.1
       z += rz * rErr * 0.1
 
-      // Track angle traveled
       const angularVel = orbitSpeed / dist
       const dAngle = angularVel * dt
 
-      let acc = particles[i * STRIDE + 8]
+      let acc = particles[i * STRIDE + OFFSET.ACCUM_ANGLE]
       acc += dAngle
-      particles[i * STRIDE + 8] = acc
+      particles[i * STRIDE + OFFSET.ACCUM_ANGLE] = acc
 
-      // Color graduation removed - particles keep original colors
+      // Gradual color transition (Visual improvement #2)
+      // 0-1 orbit: base color, 1-2 orbits: blend to orange, 2-3 orbits: blend to red
+      const orbits = acc / (Math.PI * 2)
+      if (orbits < 1) {
+        colorBlend = 0
+      } else if (orbits < 2) {
+        colorBlend = (orbits - 1) * 0.5 // 0 to 0.5 (orange)
+      } else {
+        colorBlend = 0.5 + (orbits - 2) * 0.5 // 0.5 to 1.0 (red)
+      }
+      colorBlend = Math.min(1.0, colorBlend)
+      particles[i * STRIDE + OFFSET.COLOR_BLEND] = colorBlend
 
-      // After 3 complete orbits, particle loses interest and starts drifting away
-      // After 3 complete orbits, particle loses interest and starts drifting away
       if (acc > Math.PI * 2 * 3) {
         state = STATE_LEAVING
-        particles[i * STRIDE + 7] = STATE_LEAVING
-        // Set gentle outward velocity
+        particles[i * STRIDE + OFFSET.STATE] = STATE_LEAVING
+        
+        // Release orbit layer count
+        const layer = particles[i * STRIDE + OFFSET.ORBIT_LAYER]
+        if (layer >= 0 && layer < 10) orbitLayerCounts[layer]--
+        
+        // Initialize wander angle for leaving behavior
+        wanderAngle = Math.atan2(z, x)
+        particles[i * STRIDE + OFFSET.WANDER_ANGLE] = wanderAngle
+
         const rx = x / dist
         const rz = z / dist
         vx = rx * 0.03
         vz = rz * 0.03
       }
-      // Transition to leaving after one full orbit - DISABLED
-      // Particles now orbit indefinitely without leaving
+
     } else if (state === STATE_LEAVING) {
-      // Safety check: if in LEAVING state but haven't completed 3 orbits, reset to seeking
-      const acc = particles[i * STRIDE + 8]
+      const acc = particles[i * STRIDE + OFFSET.ACCUM_ANGLE]
       if (acc < Math.PI * 2 * 3) {
         state = STATE_SEEKING
-        particles[i * STRIDE + 7] = STATE_SEEKING
-        particles[i * STRIDE + 8] = 0
+        particles[i * STRIDE + OFFSET.STATE] = STATE_SEEKING
+        particles[i * STRIDE + OFFSET.ACCUM_ANGLE] = 0
+        particles[i * STRIDE + OFFSET.COLOR_BLEND] = 0
+        particles[i * STRIDE + OFFSET.LEAVING_TIME] = 0
       } else {
-        // LEAVING BEHAVIOR - slowly drift away after orbiting
-        if (dist > 0.01) {
-          const rx = x / dist
-          const rz = z / dist
-          // Very gentle outward acceleration (Red drift)
-          vx += rx * 0.005
-          vz += rz * 0.005
-          // Friction to make it look "disinterested"
-          vx *= 0.99
-          vz *= 0.99
+        // Track how long we've been trying to leave
+        let leavingTime = particles[i * STRIDE + OFFSET.LEAVING_TIME]
+        leavingTime += dt
+        particles[i * STRIDE + OFFSET.LEAVING_TIME] = leavingTime
+
+        // Safety timeout: force respawn if stuck too long
+        const STUCK_TIMEOUT = 10.0
+        if (leavingTime > STUCK_TIMEOUT) {
+          initParticle(i)
+          continue
         }
 
-        // Respawn immediately when reaching the platform limit
+        // === URGENCY-BASED OUTWARD FORCE ===
+        // Particle becomes increasingly determined to leave over time
+        // Starts casual, becomes urgent, then desperate
+        
+        const urgencyPhase = leavingTime / 3.0  // 0-1 casual, 1-2 urgent, 2+ desperate
+        
+        // Urgency multiplier: 1.0 -> 1.5 -> 2.5 -> 4.0
+        let urgency: number
+        if (urgencyPhase < 1.0) {
+          urgency = 1.0 + urgencyPhase * 0.6  // Casual: 1.0 to 1.6
+        } else if (urgencyPhase < 2.0) {
+          urgency = 1.6 + (urgencyPhase - 1.0) * 1.4  // Urgent: 1.6 to 3.0
+        } else {
+          urgency = 3.0 + (urgencyPhase - 2.0) * 1.6  // Desperate: 3.0+
+        }
+        urgency = Math.min(6.0, urgency)  // Cap at 6x
+
+        // Outward direction
+        const rx = x / (dist + 0.001)
+        const rz = z / (dist + 0.001)
+
+        // Wander decreases as urgency increases (more focused on leaving)
+        const wanderAmount = Math.max(0.05, 0.35 - urgencyPhase * 0.15)
+        wanderAngle += (Math.random() - 0.5) * wanderAmount
+        particles[i * STRIDE + OFFSET.WANDER_ANGLE] = wanderAngle
+
+        const wanderX = Math.cos(wanderAngle)
+        const wanderZ = Math.sin(wanderAngle)
+
+        // Outward bias increases with urgency (40% -> 90%)
+        const outwardBias = Math.min(0.95, 0.5 + urgencyPhase * 0.25)
+        const moveX = wanderX * (1 - outwardBias) + rx * outwardBias
+        const moveZ = wanderZ * (1 - outwardBias) + rz * outwardBias
+
+        // Base acceleration scaled by urgency
+        const baseAccel = 0.008
+        const accel = baseAccel * urgency
+        vx += moveX * accel
+        vz += moveZ * accel
+        
+        // Friction decreases with urgency (they push harder)
+        const friction = Math.max(0.975, 0.992 - urgencyPhase * 0.006)
+        vx *= friction
+        vz *= friction
+
+        // Extra outward push in dense crowds
+        if (localDensity > 4) {
+          const crowdBoost = Math.min(0.02, localDensity * 0.002)
+          vx += rx * crowdBoost
+          vz += rz * crowdBoost
+        }
+
+        // Fade color back gradually
+        colorBlend = Math.max(0, colorBlend - dt * 0.25)
+        particles[i * STRIDE + OFFSET.COLOR_BLEND] = colorBlend
+
         const currentDist = Math.sqrt(x * x + z * z)
         if (currentDist > config.platformRadius) {
           initParticle(i)
@@ -1010,8 +1521,11 @@ function animate() {
       }
     }
 
-    // Speed limit for all particles
-    const speedLimit = config.speed * 1.5 * mySpeedMult
+    // Speed limit with density factor
+    let speedLimit = config.speed * 1.5 * mySpeedMult * densityFactor
+    if (state === STATE_LEAVING) {
+      speedLimit = config.speed * 4.0 * mySpeedMult
+    }
     const currentVel = Math.sqrt(vx * vx + vz * vz)
     if (currentVel > speedLimit) {
       vx = (vx / currentVel) * speedLimit
@@ -1021,11 +1535,10 @@ function animate() {
     x += vx * dt
     z += vz * dt
 
-    // Post-Integration Static Obstacles (Strict Constraint)
+    // Obstacle collision
     for (let k = 0; k < config.obstacleCount; k++) {
       const ox = obstacleData[k * 3]
       const oz = obstacleData[k * 3 + 1]
-      // Radius Correction: Scale * (Base 1.0 + Bevel 0.1) + Buffer ~0.05
       const or = obstacleData[k * 3 + 2] * 1.15
 
       const dx = x - ox
@@ -1039,21 +1552,19 @@ function animate() {
         const nx = dx / d
         const nz = dz / d
 
-        // Soft resolve 85% to reduce jitter
         const softPen = pen * 0.85
         x += nx * softPen
         z += nz * softPen
 
-        // Deflect velocity
         const vDotN = vx * nx + vz * nz
         if (vDotN < 0) {
-          vx -= nx * vDotN * 1.05 // Slight extra bounce to keep away
+          vx -= nx * vDotN * 1.05
           vz -= nz * vDotN * 1.05
         }
       }
     }
 
-    // Hard Central Pole Constraint (Solid Material)
+    // Pole collision
     const dPoleSq = x * x + z * z
     const minPoleDist = config.poleRadius + r1
     if (dPoleSq < minPoleDist * minPoleDist) {
@@ -1061,33 +1572,29 @@ function animate() {
       if (d > 0.0001) {
         const nx = x / d
         const nz = z / d
-        // Soft resolve 90% for the pole to avoid snapping
         const pen = minPoleDist - d
         x += nx * pen * 0.9
         z += nz * pen * 0.9
-
-        // Kill inward component and add a tiny radial push
         const vDotN = vx * nx + vz * nz
         if (vDotN < 0) {
           vx -= nx * vDotN
           vz -= nz * vDotN
         }
-        vx += nx * 0.001 // Micro push
+        vx += nx * 0.001
         vz += nz * 0.001
       } else {
-        // Fallback for extreme center case
         x = minPoleDist
         z = 0
       }
     }
 
-    particles[i * STRIDE] = x
-    particles[i * STRIDE + 1] = z
-    particles[i * STRIDE + 2] = vx
-    particles[i * STRIDE + 3] = vz
+    // Store updated values
+    particles[i * STRIDE + OFFSET.X] = x
+    particles[i * STRIDE + OFFSET.Z] = z
+    particles[i * STRIDE + OFFSET.VX] = vx
+    particles[i * STRIDE + OFFSET.VZ] = vz
 
-    // Universal respawn check - safety net for particles that escape boundaries
-    // (Leaving particles have their own respawn logic above)
+    // Respawn check
     if (state !== STATE_LEAVING) {
       const currentDist = Math.sqrt(x * x + z * z)
       if (currentDist > config.platformRadius * 2.0 || isNaN(x) || isNaN(z)) {
@@ -1096,95 +1603,99 @@ function animate() {
       }
     }
 
-    // Color Logic for Debug Mode
-    // Color Logic: Red if Orbiting/Leaving, else Base Color
-    if (state === STATE_ORBITING || state === STATE_LEAVING) {
-      _color.setHex(0xff0000) // RED
-      bodyMesh.setColorAt(i, _color)
-      headMesh.setColorAt(i, _color)
-
-      // Label Logic (Debug Mode Only)
-      if (config.debugMode) {
-        const turns = Math.floor(particles[i * STRIDE + 8] / (Math.PI * 2))
-
-        // Ensure label exists for this particle index 'i' relative to our debug list
-        let label = debugLabels[i]
-        if (!label) {
-          const mat = new THREE.SpriteMaterial({ map: getTextureForNumber(0), depthTest: false, depthWrite: false })
-          label = new THREE.Sprite(mat)
-          label.scale.set(0.1, 0.1, 0.1)
-          scene.add(label)
-          debugLabels[i] = label
-        }
-
-        label.visible = true
-        label.position.set(x, 0.25, z)
-
-        // Update texture if turn count changed
-        if (label.userData.turns !== turns) {
-          label.material.map = getTextureForNumber(turns)
-          label.userData.turns = turns
-        }
+    // --- Visual Updates ---
+    const baseColorHex = particles[i * STRIDE + OFFSET.BASE_COLOR]
+    
+    // Gradual color transition (Visual improvement #2)
+    _baseColor.setHex(baseColorHex)
+    if (colorBlend > 0) {
+      if (colorBlend <= 0.5) {
+        // Blend base -> orange
+        _color.copy(_baseColor).lerp(_orangeColor, colorBlend * 2)
+      } else {
+        // Blend orange -> red
+        _color.copy(_orangeColor).lerp(_redColor, (colorBlend - 0.5) * 2)
       }
     } else {
-      // Restore original color
-      const baseColorHex = particles[i * STRIDE + 9]
-      _color.setHex(baseColorHex)
-      bodyMesh.setColorAt(i, _color)
-      headMesh.setColorAt(i, _color)
+      _color.copy(_baseColor)
+    }
+    bodyMesh.setColorAt(i, _color)
+    headMesh.setColorAt(i, _color)
 
-      // Hide label if it exists (for when it respawns or leaves orbiting state)
-      if (debugLabels[i]) {
-        debugLabels[i].visible = false
+    // Debug labels
+    if (config.debugMode && (state === STATE_ORBITING || state === STATE_LEAVING)) {
+      const turns = Math.floor(particles[i * STRIDE + OFFSET.ACCUM_ANGLE] / (Math.PI * 2))
+      let label = debugLabels[i]
+      if (!label) {
+        const mat = new THREE.SpriteMaterial({ map: getTextureForNumber(0), depthTest: false, depthWrite: false })
+        label = new THREE.Sprite(mat)
+        label.scale.set(0.1, 0.1, 0.1)
+        scene.add(label)
+        debugLabels[i] = label
       }
+      label.visible = true
+      label.position.set(x, 0.25, z)
+      if (label.userData.turns !== turns) {
+        label.material.map = getTextureForNumber(turns)
+        label.userData.turns = turns
+      }
+    } else if (debugLabels[i]) {
+      debugLabels[i].visible = false
     }
 
-    // Update Meshes (Size is restored to normal)
+    // --- Scale Variation by State (Visual improvement #4) ---
+    let scaleMultiplier = 1.0
+    if (state === STATE_SEEKING) {
+      // Slight excitement near pole
+      const proximityExcitement = Math.max(0, 1.0 - (dist - config.poleRadius) / 3.0)
+      scaleMultiplier = 1.0 + proximityExcitement * 0.1
+    } else if (state === STATE_ORBITING) {
+      // Pulse/breathe effect while orbiting
+      const breathe = Math.sin(globalTime * 4 + myPhase) * 0.05
+      scaleMultiplier = 1.05 + breathe
+    } else if (state === STATE_LEAVING) {
+      // Shrink as they lose interest
+      const shrinkProgress = Math.min(1.0, (dist - config.poleRadius) / (config.platformRadius - config.poleRadius))
+      scaleMultiplier = 1.0 - shrinkProgress * 0.15
+    }
+
+    // --- Bobbing Animation (Visual improvement #3) ---
+    let bobOffset = 0
+    if (config.enableBobbing) {
+      const speed = Math.sqrt(vx * vx + vz * vz)
+      const bobFrequency = 8 + speed * 20
+      bobOffset = Math.sin(globalTime * bobFrequency + myPhase) * config.bobbingIntensity * speed * 5
+    }
+
     const normalizedScale = r1 / (0.03 * 1.5)
-    updateParticleMesh(i, x, z, normalizedScale)
+    updateParticleMesh(i, x, z, normalizedScale, vx, vz, bobOffset, scaleMultiplier)
 
     // --- Trail Update ---
     if (config.showTrails) {
-      // Only update if relevant state (Orbiting/Leaving) -> Red particles
-      // Or simpler: Update ALL, but maybe that's too expensive?
-      // User asked "trace behind the RED people".
+      const isActive = (state === STATE_ORBITING || state === STATE_LEAVING)
 
-      const isRed = (state === STATE_ORBITING || state === STATE_LEAVING)
-
-      if (isRed) {
-        // 0. Check for discontinuity (Stale history or Teleport)
+      if (isActive) {
         const peekIdx = (i * MAX_TRAIL_LENGTH + trailHeads[i]) * 3
         const lastX = trailHistory[peekIdx]
         const lastZ = trailHistory[peekIdx + 2]
-
-        // If last point is far away (e.g. > 1 unit) or 'empty' (99999), reset.
         const dSq = (x - lastX) * (x - lastX) + (z - lastZ) * (z - lastZ)
 
         if (dSq > 1.0 || lastX > 5000) {
           resetTrail(i, x, 0.1, z)
         }
 
-        // 1. Advance head
         let head = trailHeads[i]
         head = (head + 1) % config.trailLength
         trailHeads[i] = head
 
-        // 2. Write new pos to history
-        // Offset Y slightly (0.1) so it doesn't clip floor
         const hIdx = (i * MAX_TRAIL_LENGTH + head) * 3
         trailHistory[hIdx] = x
         trailHistory[hIdx + 1] = 0.1
         trailHistory[hIdx + 2] = z
 
-        // 3. Update Geometry Line Segments
-        // Segment J connects History[(head - J)] to History[(head - J - 1)]
-        // We need to write into 'trailPositions'
-
-        // Base offset for this particle's vertices in the single geometry
         const vBase = i * SEGMENTS_PER_PARTICLE * 2 * 3
 
         for (let s = 0; s < config.trailLength - 1; s++) {
-          // Current point index in Ring Buffer
           let currRingIdx = (head - s)
           if (currRingIdx < 0) currRingIdx += config.trailLength
 
@@ -1194,41 +1705,16 @@ function animate() {
           const p1Idx = (i * MAX_TRAIL_LENGTH + currRingIdx) * 3
           const p2Idx = (i * MAX_TRAIL_LENGTH + prevRingIdx) * 3
 
-          // Write Segment s
-          // Vertex 1
           trailPositions[vBase + s * 6 + 0] = trailHistory[p1Idx]
           trailPositions[vBase + s * 6 + 1] = trailHistory[p1Idx + 1]
           trailPositions[vBase + s * 6 + 2] = trailHistory[p1Idx + 2]
-
-          // Vertex 2
           trailPositions[vBase + s * 6 + 3] = trailHistory[p2Idx]
           trailPositions[vBase + s * 6 + 4] = trailHistory[p2Idx + 1]
           trailPositions[vBase + s * 6 + 5] = trailHistory[p2Idx + 2]
         }
-
       } else {
-        // Not red: collapse trail to current pos invisible
-        // Or just don't update? If we don't update, old trail freezes.
-        // Better to collapse it.
-        // Optimization: check if already collapsed?
-
-        // Just reset history head to current pos
-        // To "Hide", we can set all vertices to 0,0,0
-        // But let's just use resetTrail logic lazily?
-        // Actually, let's just write NaNs or far away points into the vertex buffer?
-        // Fast check: if not red, just skip? No, we need to clear artifacts.
-
-        // Ideally we only run this once when state changes, but we don't track state change here.
-        // Let's just set the first vertex to 99999?
-        // No, LineSegments renders everything.
-
-        // Quick hack: If not red, set all segments for this particle to 99999
-        // Only update if it WAS red recently?
-        // Let's just do it every frame for non-reds until we optimize.
-
-        // Optimization: Only update if the first vertex is NOT 99999
         const vBase = i * SEGMENTS_PER_PARTICLE * 2 * 3
-        if (trailPositions[vBase] < 5000) { // If visible
+        if (trailPositions[vBase] < 5000) {
           for (let k = 0; k < SEGMENTS_PER_PARTICLE * 2 * 3; k++) {
             trailPositions[vBase + k] = 99999
           }
@@ -1244,57 +1730,36 @@ function animate() {
     trailMesh.visible = false
   }
 
-  // --- Pheromone Update ---
+  // Pheromone update
   if (config.showPheromones) {
     pheromoneMesh.visible = true
-
-    // 1. Fade out (Decay)
     pheromoneCtx.fillStyle = 'rgba(0, 0, 0, 0.05)'
     pheromoneCtx.fillRect(0, 0, PHEROMONE_SIZE, PHEROMONE_SIZE)
-
-    // 2. Draw active red particles
-    // Optimize: Only iterate if we have some particles?
-    pheromoneCtx.fillStyle = 'rgba(255, 50, 50, 0.5)'
+    pheromoneCtx.fillStyle = 'rgba(100, 200, 255, 0.5)'
     pheromoneCtx.beginPath()
 
-    // Map world to canvas. World range approx +/- 12 for safety.
-    const mapRange = 24.0 // matches plane geometry size
+    const mapRange = 24.0
     const halfMap = mapRange / 2.0
-
     let pointsDrawn = 0
 
     for (let i = 0; i < config.particleCount; i++) {
-      // Red check: Orbiting or Leaving
-      // We can check state directly without array lookup if possible, but stuck with array
-      const state = particles[i * STRIDE + 7]
-
+      const state = particles[i * STRIDE + OFFSET.STATE]
       if (state === STATE_ORBITING || state === STATE_LEAVING) {
-        const x = particles[i * STRIDE]
-        const z = particles[i * STRIDE + 1]
-
-        // Map x [-12, 12] -> [0, 1024]
-        // u = (x + 12) / 24
+        const x = particles[i * STRIDE + OFFSET.X]
+        const z = particles[i * STRIDE + OFFSET.Z]
         const u = (x + halfMap) / mapRange
         const v = (z + halfMap) / mapRange
-
         if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
           const px = u * PHEROMONE_SIZE
-          const py = v * PHEROMONE_SIZE // Inverted Y? Z grows down in 2D? typically +Z is down/south in 3D (top view)
-          // Canvas Y is down. Z is "down" in top-down view. So +Z maps to +Y. correct.
-
+          const py = v * PHEROMONE_SIZE
           pheromoneCtx.moveTo(px, py)
-          pheromoneCtx.arc(px, py, 3, 0, Math.PI * 2) // Radius 3 pixels
+          pheromoneCtx.arc(px, py, 3, 0, Math.PI * 2)
           pointsDrawn++
         }
       }
     }
-
-    if (pointsDrawn > 0) {
-      pheromoneCtx.fill()
-    }
-
+    if (pointsDrawn > 0) pheromoneCtx.fill()
     pheromoneTexture.needsUpdate = true
-
   } else {
     pheromoneMesh.visible = false
   }
