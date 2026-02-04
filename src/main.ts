@@ -810,16 +810,16 @@ function animate() {
                 // Rigid overlap
                 if (d < combinedRadius) {
                   const overlap = combinedRadius - d
-                  const push = overlap * 0.5
-                  const pushMult = (state === STATE_ORBITING) ? 0.2 : 0.5
+                  const push = overlap * 0.45 // Slightly softened from 0.5
+                  const pushMult = (state === STATE_ORBITING) ? 0.15 : 0.4 // Softened
                   x += nx * push * pushMult
                   z += nz * push * pushMult
                 }
 
                 // Separation
                 const force = (softRadius - d) / d
-                sepX += nx * force
-                sepZ += nz * force
+                sepX += nx * force * 0.8 // Smoother separation
+                sepZ += nz * force * 0.8
               }
             }
             j = gridNext[j]
@@ -857,17 +857,24 @@ function animate() {
       let speedFactor = 1.0
       if (dist > 0.1 && dist < 5.0) {
         speedFactor = 1.0 + config.vortexStrength * (5.0 / dist - 1.0)
-        speedFactor = Math.max(0.1, Math.min(speedFactor, 3.0))
+        // Add "Excitement": Speed increases as they get closer to the pole
+        const proximityExcitement = Math.max(0, 1.0 - (dist - config.poleRadius) / 5.0)
+        speedFactor *= (1.0 + proximityExcitement * 0.8)
+        speedFactor = Math.max(0.1, Math.min(speedFactor, 4.0))
       }
 
       const currentSpeed = config.speed * speedFactor * mySpeedMult
       const desiredVx = dx * currentSpeed
       const desiredVz = dz * currentSpeed
 
+      // Steering Excitement: agility increase as they get closer
+      const proximityExcitement = Math.max(0, 1.0 - (dist - config.poleRadius) / 3.0)
+      const dynamicAgility = myAgilityMult * (1.0 + proximityExcitement * 2.0)
+
       // Steering
       let steeringX = desiredVx - vx
       let steeringZ = desiredVz - vz
-      const maxSteer = 0.05 * myAgilityMult // Increased from 0.02 to overcome centrifugal force
+      const maxSteer = 0.05 * dynamicAgility // Increased based on proximity
 
       const steerLen = Math.sqrt(steeringX * steeringX + steeringZ * steeringZ)
       if (steerLen > maxSteer) {
@@ -875,8 +882,8 @@ function animate() {
         steeringZ = (steeringZ / steerLen) * maxSteer
       }
 
-      vx += steeringX
-      vz += steeringZ
+      vx += steeringX * 0.8 // Slightly dampened steering to reduce jitter
+      vz += steeringZ * 0.8
 
       if (dist > 0.001) {
         vx -= (x / dist) * config.centrifugalForce * 0.05 // Reduced from 0.1
@@ -986,12 +993,12 @@ function animate() {
         if (dist > 0.01) {
           const rx = x / dist
           const rz = z / dist
-          // Very gentle outward acceleration
-          vx += rx * 0.01
-          vz += rz * 0.01
-          // Light friction
-          vx *= 0.98
-          vz *= 0.98
+          // Very gentle outward acceleration (Red drift)
+          vx += rx * 0.005
+          vz += rz * 0.005
+          // Friction to make it look "disinterested"
+          vx *= 0.99
+          vz *= 0.99
         }
 
         // Respawn immediately when reaching the platform limit
@@ -1032,15 +1039,16 @@ function animate() {
         const nx = dx / d
         const nz = dz / d
 
-        // Hard resolve 100%
-        x += nx * pen
-        z += nz * pen
+        // Soft resolve 85% to reduce jitter
+        const softPen = pen * 0.85
+        x += nx * softPen
+        z += nz * softPen
 
         // Deflect velocity
         const vDotN = vx * nx + vz * nz
         if (vDotN < 0) {
-          vx -= nx * vDotN
-          vz -= nz * vDotN
+          vx -= nx * vDotN * 1.05 // Slight extra bounce to keep away
+          vz -= nz * vDotN * 1.05
         }
       }
     }
@@ -1053,14 +1061,19 @@ function animate() {
       if (d > 0.0001) {
         const nx = x / d
         const nz = z / d
-        x = nx * minPoleDist
-        z = nz * minPoleDist
-        // Kill inward component
+        // Soft resolve 90% for the pole to avoid snapping
+        const pen = minPoleDist - d
+        x += nx * pen * 0.9
+        z += nz * pen * 0.9
+
+        // Kill inward component and add a tiny radial push
         const vDotN = vx * nx + vz * nz
         if (vDotN < 0) {
           vx -= nx * vDotN
           vz -= nz * vDotN
         }
+        vx += nx * 0.001 // Micro push
+        vz += nz * 0.001
       } else {
         // Fallback for extreme center case
         x = minPoleDist
