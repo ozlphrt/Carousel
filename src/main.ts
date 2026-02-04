@@ -26,8 +26,12 @@ const config = {
   bloomStrength: 0.1398,
   bloomRadius: 0.5,
   bloomThreshold: 0,
-  obstacleCount: 12,
-  obstacleRadius: 0.3
+  obstacleCount: 15,
+  obstacleRadius: 0.3,
+  debugMode: false, // Toggle for debugging
+  showTrails: false,
+  trailLength: 30,
+  showPheromones: false
 }
 
 // --- Global Data definitions ---
@@ -48,6 +52,13 @@ const gridNext = new Int32Array(MAX_PARTICLE_COUNT)
 const obstacleData = new Float32Array(config.obstacleCount * 3)
 const obstacleMeshes: THREE.Mesh[] = []
 
+// Interaction State
+type DragMode = 'NONE' | 'MOVE'
+let dragMode: DragMode = 'NONE'
+let dragOffset = new THREE.Vector3()
+let raycaster = new THREE.Raycaster()
+let mouse = new THREE.Vector2()
+
 // --- Scene Setup ---
 const canvas = document.createElement('canvas')
 document.body.appendChild(canvas)
@@ -55,6 +66,86 @@ document.body.appendChild(canvas)
 const scene = new THREE.Scene()
 scene.background = new THREE.Color(config.backgroundColor)
 scene.fog = new THREE.FogExp2(config.backgroundColor, 0.02)
+
+// --- Trail System ---
+// Flattened history buffer: [p0_trail0_x, p0_trail0_y, p0_trail0_z, p0_trail1_x, ...]
+// BUT better layout for LineSegments memory locality:
+// We need constant segments. 
+// Let's allocate MAXIMUM buffers, but we can't draw ALL lines every frame efficiently if we update the buffer geometry.
+// Actually, updating a few thousand float attributes is fast in JS/WebGL.
+
+const MAX_TRAIL_LENGTH = 50
+
+// Per particle: ring buffer state
+const trailHeads = new Int32Array(MAX_PARTICLE_COUNT).fill(0)
+// The actual position history storage [ParticleID][HistoryIndex][3] -> Flattened: P * L * 3
+const trailHistory = new Float32Array(MAX_PARTICLE_COUNT * MAX_TRAIL_LENGTH * 3)
+
+// The geometry for LineSegments
+// Each particle has (L-1) segments.
+// Total vertices = MAX_PARTICLE_COUNT * (MAX_TRAIL_LENGTH - 1) * 2
+const SEGMENTS_PER_PARTICLE = MAX_TRAIL_LENGTH - 1
+const TRAIL_VERTEX_COUNT = MAX_PARTICLE_COUNT * SEGMENTS_PER_PARTICLE * 2
+const trailGeometry = new THREE.BufferGeometry()
+const trailPositions = new Float32Array(TRAIL_VERTEX_COUNT * 3)
+trailGeometry.setAttribute('position', new THREE.BufferAttribute(trailPositions, 3))
+
+// Pre-fill history with far away points so we don't draw lines at 0,0,0 initially
+for (let i = 0; i < trailHistory.length; i++) {
+  trailHistory[i] = 99999
+}
+for (let i = 0; i < trailPositions.length; i++) {
+  trailPositions[i] = 99999
+}
+
+const trailMaterial = new THREE.LineBasicMaterial({
+  color: 0xff0000,
+  transparent: true,
+  opacity: 0.5,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false
+})
+const trailMesh = new THREE.LineSegments(trailGeometry, trailMaterial)
+trailMesh.frustumCulled = false // Always draw
+scene.add(trailMesh)
+
+function resetTrail(i: number, x: number, y: number, z: number) {
+  // Fill entire ring buffer with current pos to "collapse" the trail
+  for (let k = 0; k < MAX_TRAIL_LENGTH; k++) {
+    const idx = (i * MAX_TRAIL_LENGTH + k) * 3
+    trailHistory[idx] = x
+    trailHistory[idx + 1] = y
+    trailHistory[idx + 2] = z
+  }
+}
+
+
+// --- Pheromone System ---
+const PHEROMONE_SIZE = 1024
+const pheromoneCanvas = document.createElement('canvas')
+pheromoneCanvas.width = PHEROMONE_SIZE
+pheromoneCanvas.height = PHEROMONE_SIZE
+const pheromoneCtx = pheromoneCanvas.getContext('2d')!
+pheromoneCtx.fillStyle = '#000000'
+pheromoneCtx.fillRect(0, 0, PHEROMONE_SIZE, PHEROMONE_SIZE)
+
+const pheromoneTexture = new THREE.CanvasTexture(pheromoneCanvas)
+pheromoneTexture.minFilter = THREE.LinearFilter
+pheromoneTexture.magFilter = THREE.LinearFilter // Smooth look
+
+const pheromoneGeometry = new THREE.PlaneGeometry(24, 24) // Covers approx platform + buffer
+const pheromoneMaterial = new THREE.MeshBasicMaterial({
+  map: pheromoneTexture,
+  transparent: true,
+  opacity: 0.8,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  side: THREE.DoubleSide
+})
+const pheromoneMesh = new THREE.Mesh(pheromoneGeometry, pheromoneMaterial)
+pheromoneMesh.rotation.x = -Math.PI / 2
+pheromoneMesh.position.y = 0.015 // Slightly above grid
+scene.add(pheromoneMesh)
 
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000)
 camera.position.set(0, 2.0, 4.5)
@@ -84,57 +175,71 @@ controls.enableDamping = true
 controls.maxPolarAngle = Math.PI / 2 - 0.1
 
 // --- Interact / Raycasting ---
-const raycaster = new THREE.Raycaster()
-const pointer = new THREE.Vector2()
+// raycaster, pointer, etc already defined above
 const planeGeometry = new THREE.PlaneGeometry(100, 100)
 const plane = new THREE.Mesh(planeGeometry, new THREE.MeshBasicMaterial({ visible: false }))
 plane.rotation.x = -Math.PI / 2
 plane.position.y = 0.5
 scene.add(plane)
 
-let draggedObject: THREE.Object3D | null = null
+// Tracks circular obstacles
+let draggedCircleIndex = -1
 
 window.addEventListener('pointerdown', (event) => {
-  pointer.x = (event.clientX / window.innerWidth) * 2 - 1
-  pointer.y = -(event.clientY / window.innerHeight) * 2 + 1
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1
 
-  raycaster.setFromCamera(pointer, camera)
+  raycaster.setFromCamera(mouse, camera)
+
   const intersects = raycaster.intersectObjects(obstacleMeshes)
 
   if (intersects.length > 0) {
-    draggedObject = intersects[0].object
-    controls.enabled = false
-  }
-})
+    const hit = intersects[0]
+    const idx = obstacleMeshes.indexOf(hit.object as THREE.Mesh)
 
-window.addEventListener('pointermove', (event) => {
-  pointer.x = (event.clientX / window.innerWidth) * 2 - 1
-  pointer.y = -(event.clientY / window.innerHeight) * 2 + 1
+    if (idx !== -1) {
+      dragMode = 'MOVE'
+      draggedCircleIndex = idx
+      controls.enabled = false
 
-  if (draggedObject) {
-    raycaster.setFromCamera(pointer, camera)
-    const intersects = raycaster.intersectObject(plane)
-    if (intersects.length > 0) {
-      const pt = intersects[0].point
-      const dist = Math.sqrt(pt.x * pt.x + pt.z * pt.z)
-      const maxR = config.platformRadius - 0.5
-
-      if (dist < maxR) {
-        draggedObject.position.set(pt.x, draggedObject.position.y, pt.z)
-        // Update collision data
-        const index = obstacleMeshes.indexOf(draggedObject as THREE.Mesh)
-        if (index !== -1) {
-          obstacleData[index * 3] = pt.x
-          obstacleData[index * 3 + 1] = pt.z
-        }
+      // Offset
+      const groundInt = raycaster.intersectObject(plane)
+      if (groundInt.length > 0) {
+        dragOffset.copy(hit.object.position).sub(groundInt[0].point)
       }
     }
   }
 })
 
+window.addEventListener('pointermove', (event) => {
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1
+
+  if (dragMode !== 'NONE' && draggedCircleIndex !== -1) {
+    raycaster.setFromCamera(mouse, camera)
+    const intersects = raycaster.intersectObject(plane)
+
+    if (intersects.length > 0) {
+      const pt = intersects[0].point
+      const newPos = pt.clone().add(dragOffset)
+
+      // Update Mesh
+      const mesh = obstacleMeshes[draggedCircleIndex]
+      mesh.position.set(newPos.x, 0, newPos.z)
+
+      // Update Data
+      obstacleData[draggedCircleIndex * 3 + 0] = newPos.x
+      obstacleData[draggedCircleIndex * 3 + 1] = newPos.z
+    }
+  }
+})
+
 window.addEventListener('pointerup', () => {
-  draggedObject = null
-  controls.enabled = true
+  if (dragMode !== 'NONE') {
+    controls.enabled = true
+    dragMode = 'NONE'
+    draggedCircleIndex = -1
+  }
 })
 
 // --- Stats ---
@@ -329,15 +434,12 @@ obstacleMaterial.onBeforeCompile = (shader) => {
     float gz = step(1.0 - lineWidth, fract(vWorldPosition.z * 2.0));
     float grid = max(gx, gz);
     
-    // Add a pulsing glow
-    float pulse = 0.5 + 0.5 * sin(vWorldPosition.y * 10.0 - 2.0); // No time var yet easily accessible without updateloop
-    
     // Mix with base color
-    vec3 gridColor = vec3(0.0, 0.8, 1.0) * 2.0; // Cyan glow
+    vec3 gridColor = vec3(0.0, 0.8, 1.0) * 2.0; 
     
     if (grid > 0.5) {
         gl_FragColor.rgb = mix(gl_FragColor.rgb, gridColor, 0.5);
-        gl_FragColor.rgb += gridColor * 0.2; // Addative bloom
+        gl_FragColor.rgb += gridColor * 0.2; 
     }
     `
   )
@@ -347,25 +449,25 @@ for (let i = 0; i < config.obstacleCount; i++) {
   const obs = new THREE.Mesh(obstacleGeometry, obstacleMaterial.clone())
   obs.castShadow = true
   obs.receiveShadow = true
-
-  // Correction: Extrude is Z-up, we need Y-up
-  obs.rotation.x = -Math.PI / 2
-
+  obs.rotation.x = -Math.PI / 2 // Lay flat
   scene.add(obs)
   obstacleMeshes.push(obs)
 
-  const angle = Math.random() * Math.PI * 2
-  const rRandom = Math.random()
-  let obsR = 0.0
-  if (rRandom > 0.7) {
-    obsR = 1.0 + Math.random() * 0.3
+  // Random size
+  let obsR = 0
+  const isLarge = Math.random() > 0.8
+  if (isLarge) {
+    obsR = 0.8 + Math.random() * 0.4
   } else {
-    obsR = 0.3 + Math.random() * 0.5
+    obsR = 0.4 + Math.random() * 0.3
   }
 
   const obsHeight = 0.36
+
+  // Position
   const distRangeMin = config.poleRadius + obsR + 0.2
   const distRangeMax = config.platformRadius - obsR - 0.2
+  const angle = Math.random() * Math.PI * 2
   const r = Math.sqrt(Math.random() * (distRangeMax * distRangeMax - distRangeMin * distRangeMin) + distRangeMin * distRangeMin)
   const x = Math.cos(angle) * r
   const z = Math.sin(angle) * r
@@ -426,6 +528,9 @@ function initParticle(i: number) {
   particles[i * STRIDE + 6] = agilityMult
   particles[i * STRIDE + 7] = STATE_SEEKING
   particles[i * STRIDE + 8] = 0 // accumAngle
+
+  // Reset Trail for this particle
+  resetTrail(i, x, 0.09 * scale, z)
 
   const colorHex = palette[Math.floor(Math.random() * palette.length)]
   particles[i * STRIDE + 9] = colorHex // Base color
@@ -493,6 +598,8 @@ function updateGrid() {
 // --- GUI ---
 const gui = new GUI({ title: 'Carousel Settings' })
 const sceneFolder = gui.addFolder('Visuals')
+sceneFolder.add(config, 'showTrails').name('Show Traces (Red)').onChange((v: boolean) => trailMesh.visible = v)
+sceneFolder.add(config, 'showPheromones').name('Show Pheromones').onChange((v: boolean) => pheromoneMesh.visible = v)
 sceneFolder.addColor(config, 'backgroundColor').onChange((c: string) => {
   scene.background = new THREE.Color(c)
   scene.fog = new THREE.FogExp2(c, 0.02)
@@ -527,6 +634,46 @@ physicsFolder.add(config, 'centrifugalForce', -0.3, 0.1).name('Centrifugal Force
 physicsFolder.add(config, 'vortexStrength', 0, 2).name('Vortex Strength')
 physicsFolder.add(config, 'particleCount').name('Active Count').listen().disable()
 
+// Debug Mode Logic
+const debugLabels: THREE.Sprite[] = []
+const labelTextureCache: { [key: number]: THREE.Texture } = {}
+
+function getTextureForNumber(n: number) {
+  if (labelTextureCache[n]) return labelTextureCache[n]
+
+  const canvas = document.createElement('canvas')
+  canvas.width = 64
+  canvas.height = 64
+  const ctx = canvas.getContext('2d')!
+  ctx.fillStyle = 'white'
+  ctx.font = 'bold 48px Arial'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(n.toString(), 32, 32)
+
+  const tex = new THREE.CanvasTexture(canvas)
+  labelTextureCache[n] = tex
+  return tex
+}
+
+function updateDebugMode() {
+  if (config.debugMode) {
+    // RESET to 100 particles
+    config.particleCount = 100
+    // Reinforce limits
+    for (let i = 100; i < MAX_PARTICLE_COUNT; i++) {
+      // Reset state for unused particles just in case
+      particles[i * STRIDE + 7] = STATE_SEEKING
+    }
+  } else {
+    // Clear labels
+    debugLabels.forEach(l => scene.remove(l))
+    debugLabels.length = 0
+  }
+}
+
+gui.add(config, 'debugMode').name('Debug Mode (100 Ppl)').onChange(updateDebugMode)
+
 gui.domElement.style.display = 'none'
 
 const cogButton = document.createElement('button')
@@ -558,7 +705,6 @@ window.addEventListener('resize', () => {
 })
 
 // --- Animation Loop ---
-// --- Animation Loop ---
 const TARGET_POPULATION = 15000
 
 function animate() {
@@ -566,7 +712,7 @@ function animate() {
   frames++
   if (now - lastFpsUpdate >= 500) {
     const fps = Math.round((frames * 1000) / (now - lastFpsUpdate))
-    fpsDiv.innerText = `FPS: ${fps} | Count: ${config.particleCount}`
+    fpsDiv.innerText = 'FPS: ' + fps + ' | Count: ' + config.particleCount
     lastFpsUpdate = now
     frames = 0
   }
@@ -577,11 +723,19 @@ function animate() {
     const startIdx = config.particleCount
     const endIdx = Math.min(startIdx + spawnRate, TARGET_POPULATION)
 
-    for (let i = startIdx; i < endIdx; i++) {
-      initParticle(i)
+    // DEBUG MODE: Prevent spawning beyond 100
+    if (!config.debugMode || config.particleCount < 100) {
+      for (let i = startIdx; i < endIdx; i++) {
+        if (config.debugMode && i >= 100) break;
+        initParticle(i)
+      }
+      if (config.debugMode) {
+        config.particleCount = Math.min(config.particleCount + spawnRate, 100)
+      } else {
+        config.particleCount = endIdx
+      }
     }
 
-    config.particleCount = endIdx
     bodyMesh.count = config.particleCount
     headMesh.count = config.particleCount
     bodyMesh.instanceMatrix.needsUpdate = true
@@ -713,7 +867,7 @@ function animate() {
       // Steering
       let steeringX = desiredVx - vx
       let steeringZ = desiredVz - vz
-      const maxSteer = 0.02 * myAgilityMult
+      const maxSteer = 0.05 * myAgilityMult // Increased from 0.02 to overcome centrifugal force
 
       const steerLen = Math.sqrt(steeringX * steeringX + steeringZ * steeringZ)
       if (steerLen > maxSteer) {
@@ -725,8 +879,8 @@ function animate() {
       vz += steeringZ
 
       if (dist > 0.001) {
-        vx -= (x / dist) * config.centrifugalForce * 0.1
-        vz -= (z / dist) * config.centrifugalForce * 0.1
+        vx -= (x / dist) * config.centrifugalForce * 0.05 // Reduced from 0.1
+        vz -= (z / dist) * config.centrifugalForce * 0.05
       }
 
       // Touch Check - particles must actually touch the pole to start orbiting
@@ -808,6 +962,7 @@ function animate() {
       // Color graduation removed - particles keep original colors
 
       // After 3 complete orbits, particle loses interest and starts drifting away
+      // After 3 complete orbits, particle loses interest and starts drifting away
       if (acc > Math.PI * 2 * 3) {
         state = STATE_LEAVING
         particles[i * STRIDE + 7] = STATE_LEAVING
@@ -839,9 +994,9 @@ function animate() {
           vz *= 0.98
         }
 
-        // Respawn only when drifted far away (check after position update)
+        // Respawn immediately when reaching the platform limit
         const currentDist = Math.sqrt(x * x + z * z)
-        if (currentDist > config.platformRadius * 1.5) {
+        if (currentDist > config.platformRadius) {
           initParticle(i)
           continue
         }
@@ -901,18 +1056,217 @@ function animate() {
     // (Leaving particles have their own respawn logic above)
     if (state !== STATE_LEAVING) {
       const currentDist = Math.sqrt(x * x + z * z)
-      if (currentDist > config.platformRadius * 1.05 || isNaN(x) || isNaN(z)) {
+      if (currentDist > config.platformRadius * 2.0 || isNaN(x) || isNaN(z)) {
         initParticle(i)
         continue
+      }
+    }
+
+    // Color Logic for Debug Mode
+    // Color Logic: Red if Orbiting/Leaving, else Base Color
+    if (state === STATE_ORBITING || state === STATE_LEAVING) {
+      _color.setHex(0xff0000) // RED
+      bodyMesh.setColorAt(i, _color)
+      headMesh.setColorAt(i, _color)
+
+      // Label Logic (Debug Mode Only)
+      if (config.debugMode) {
+        const turns = Math.floor(particles[i * STRIDE + 8] / (Math.PI * 2))
+
+        // Ensure label exists for this particle index 'i' relative to our debug list
+        let label = debugLabels[i]
+        if (!label) {
+          const mat = new THREE.SpriteMaterial({ map: getTextureForNumber(0), depthTest: false, depthWrite: false })
+          label = new THREE.Sprite(mat)
+          label.scale.set(0.1, 0.1, 0.1)
+          scene.add(label)
+          debugLabels[i] = label
+        }
+
+        label.visible = true
+        label.position.set(x, 0.25, z)
+
+        // Update texture if turn count changed
+        if (label.userData.turns !== turns) {
+          label.material.map = getTextureForNumber(turns)
+          label.userData.turns = turns
+        }
+      }
+    } else {
+      // Restore original color
+      const baseColorHex = particles[i * STRIDE + 9]
+      _color.setHex(baseColorHex)
+      bodyMesh.setColorAt(i, _color)
+      headMesh.setColorAt(i, _color)
+
+      // Hide label if it exists (for when it respawns or leaves orbiting state)
+      if (debugLabels[i]) {
+        debugLabels[i].visible = false
       }
     }
 
     // Update Meshes (Size is restored to normal)
     const normalizedScale = r1 / (0.03 * 1.5)
     updateParticleMesh(i, x, z, normalizedScale)
+
+    // --- Trail Update ---
+    if (config.showTrails) {
+      // Only update if relevant state (Orbiting/Leaving) -> Red particles
+      // Or simpler: Update ALL, but maybe that's too expensive?
+      // User asked "trace behind the RED people".
+
+      const isRed = (state === STATE_ORBITING || state === STATE_LEAVING)
+
+      if (isRed) {
+        // 0. Check for discontinuity (Stale history or Teleport)
+        const peekIdx = (i * MAX_TRAIL_LENGTH + trailHeads[i]) * 3
+        const lastX = trailHistory[peekIdx]
+        const lastZ = trailHistory[peekIdx + 2]
+
+        // If last point is far away (e.g. > 1 unit) or 'empty' (99999), reset.
+        const dSq = (x - lastX) * (x - lastX) + (z - lastZ) * (z - lastZ)
+
+        if (dSq > 1.0 || lastX > 5000) {
+          resetTrail(i, x, 0.1, z)
+        }
+
+        // 1. Advance head
+        let head = trailHeads[i]
+        head = (head + 1) % config.trailLength
+        trailHeads[i] = head
+
+        // 2. Write new pos to history
+        // Offset Y slightly (0.1) so it doesn't clip floor
+        const hIdx = (i * MAX_TRAIL_LENGTH + head) * 3
+        trailHistory[hIdx] = x
+        trailHistory[hIdx + 1] = 0.1
+        trailHistory[hIdx + 2] = z
+
+        // 3. Update Geometry Line Segments
+        // Segment J connects History[(head - J)] to History[(head - J - 1)]
+        // We need to write into 'trailPositions'
+
+        // Base offset for this particle's vertices in the single geometry
+        const vBase = i * SEGMENTS_PER_PARTICLE * 2 * 3
+
+        for (let s = 0; s < config.trailLength - 1; s++) {
+          // Current point index in Ring Buffer
+          let currRingIdx = (head - s)
+          if (currRingIdx < 0) currRingIdx += config.trailLength
+
+          let prevRingIdx = (head - s - 1)
+          if (prevRingIdx < 0) prevRingIdx += config.trailLength
+
+          const p1Idx = (i * MAX_TRAIL_LENGTH + currRingIdx) * 3
+          const p2Idx = (i * MAX_TRAIL_LENGTH + prevRingIdx) * 3
+
+          // Write Segment s
+          // Vertex 1
+          trailPositions[vBase + s * 6 + 0] = trailHistory[p1Idx]
+          trailPositions[vBase + s * 6 + 1] = trailHistory[p1Idx + 1]
+          trailPositions[vBase + s * 6 + 2] = trailHistory[p1Idx + 2]
+
+          // Vertex 2
+          trailPositions[vBase + s * 6 + 3] = trailHistory[p2Idx]
+          trailPositions[vBase + s * 6 + 4] = trailHistory[p2Idx + 1]
+          trailPositions[vBase + s * 6 + 5] = trailHistory[p2Idx + 2]
+        }
+
+      } else {
+        // Not red: collapse trail to current pos invisible
+        // Or just don't update? If we don't update, old trail freezes.
+        // Better to collapse it.
+        // Optimization: check if already collapsed?
+
+        // Just reset history head to current pos
+        // To "Hide", we can set all vertices to 0,0,0
+        // But let's just use resetTrail logic lazily?
+        // Actually, let's just write NaNs or far away points into the vertex buffer?
+        // Fast check: if not red, just skip? No, we need to clear artifacts.
+
+        // Ideally we only run this once when state changes, but we don't track state change here.
+        // Let's just set the first vertex to 99999?
+        // No, LineSegments renders everything.
+
+        // Quick hack: If not red, set all segments for this particle to 99999
+        // Only update if it WAS red recently?
+        // Let's just do it every frame for non-reds until we optimize.
+
+        // Optimization: Only update if the first vertex is NOT 99999
+        const vBase = i * SEGMENTS_PER_PARTICLE * 2 * 3
+        if (trailPositions[vBase] < 5000) { // If visible
+          for (let k = 0; k < SEGMENTS_PER_PARTICLE * 2 * 3; k++) {
+            trailPositions[vBase + k] = 99999
+          }
+        }
+      }
+    }
+  }
+
+  if (config.showTrails) {
+    trailMesh.visible = true
+    trailGeometry.attributes.position.needsUpdate = true
+  } else {
+    trailMesh.visible = false
+  }
+
+  // --- Pheromone Update ---
+  if (config.showPheromones) {
+    pheromoneMesh.visible = true
+
+    // 1. Fade out (Decay)
+    pheromoneCtx.fillStyle = 'rgba(0, 0, 0, 0.05)'
+    pheromoneCtx.fillRect(0, 0, PHEROMONE_SIZE, PHEROMONE_SIZE)
+
+    // 2. Draw active red particles
+    // Optimize: Only iterate if we have some particles?
+    pheromoneCtx.fillStyle = 'rgba(255, 50, 50, 0.5)'
+    pheromoneCtx.beginPath()
+
+    // Map world to canvas. World range approx +/- 12 for safety.
+    const mapRange = 24.0 // matches plane geometry size
+    const halfMap = mapRange / 2.0
+
+    let pointsDrawn = 0
+
+    for (let i = 0; i < config.particleCount; i++) {
+      // Red check: Orbiting or Leaving
+      // We can check state directly without array lookup if possible, but stuck with array
+      const state = particles[i * STRIDE + 7]
+
+      if (state === STATE_ORBITING || state === STATE_LEAVING) {
+        const x = particles[i * STRIDE]
+        const z = particles[i * STRIDE + 1]
+
+        // Map x [-12, 12] -> [0, 1024]
+        // u = (x + 12) / 24
+        const u = (x + halfMap) / mapRange
+        const v = (z + halfMap) / mapRange
+
+        if (u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+          const px = u * PHEROMONE_SIZE
+          const py = v * PHEROMONE_SIZE // Inverted Y? Z grows down in 2D? typically +Z is down/south in 3D (top view)
+          // Canvas Y is down. Z is "down" in top-down view. So +Z maps to +Y. correct.
+
+          pheromoneCtx.moveTo(px, py)
+          pheromoneCtx.arc(px, py, 3, 0, Math.PI * 2) // Radius 3 pixels
+          pointsDrawn++
+        }
+      }
+    }
+
+    if (pointsDrawn > 0) {
+      pheromoneCtx.fill()
+    }
+
+    pheromoneTexture.needsUpdate = true
+
+  } else {
+    pheromoneMesh.visible = false
   }
 
   bodyMesh.instanceMatrix.needsUpdate = true
+  bodyMesh.instanceColor!.needsUpdate = true
   headMesh.instanceMatrix.needsUpdate = true
   headMesh.instanceColor!.needsUpdate = true
   composer.render()
