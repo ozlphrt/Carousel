@@ -189,9 +189,15 @@ platform.position.y = -0.25
 platform.receiveShadow = true
 scene.add(platform)
 
-const gridHelper = new THREE.PolarGridHelper(config.platformRadius, 16, 10, 64, 0x888888, 0x444444)
-gridHelper.position.y = 0.01
-scene.add(gridHelper)
+// Minor gridlines - dense and subtle
+const minorGrid = new THREE.PolarGridHelper(config.platformRadius, 32, 10, 64, 0x333333, 0x222222)
+minorGrid.position.y = 0.01
+scene.add(minorGrid)
+
+// Major gridlines - less dense and brighter
+const majorGrid = new THREE.PolarGridHelper(config.platformRadius, 8, 4, 64, 0x555555, 0x333333)
+majorGrid.position.y = 0.02
+scene.add(majorGrid)
 
 const ringGeo = new THREE.RingGeometry(config.poleRadius + 0.1, config.poleRadius + 0.5, 32)
 ringGeo.rotateX(-Math.PI / 2)
@@ -272,13 +278,70 @@ const obstacleGeometry = new THREE.ExtrudeGeometry(obstacleShape, {
   curveSegments: 32
 })
 
-// Match Platform Material
+// Match Platform Material with Fancy Grid
 const obstacleMaterial = new THREE.MeshStandardMaterial({
   color: config.obstacleColor,
   roughness: 0.8,
   metalness: 0.2,
   envMapIntensity: 0.5
 })
+
+obstacleMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uTime = { value: 0 }
+
+  // Pass world config if needed
+  shader.fragmentShader = `
+    varying vec3 vWorldPosition;
+  ` + shader.fragmentShader
+
+  shader.vertexShader = `
+    varying vec3 vWorldPosition;
+  ` + shader.vertexShader
+
+  shader.vertexShader = shader.vertexShader.replace(
+    '#include <worldpos_vertex>',
+    `
+    #include <worldpos_vertex>
+    vWorldPosition = (modelMatrix * vec4( transformed, 1.0 )).xyz;
+    `
+  )
+
+  shader.fragmentShader = shader.fragmentShader.replace(
+    '#include <dithering_fragment>',
+    `
+    #include <dithering_fragment>
+    
+    // Grid Logic
+    float gridSize = 1.0; 
+    float lineWidth = 0.05;
+    
+    // Use local or world pos. Let's use local X/Z relative to object center 
+    // IF we are in local space. But here vWorldPosition is world.
+    
+    // Let's make a grid based on absolute world coords for a "holodeck" feel
+    // Or local object coords if we want the grid to stick to the object.
+    
+    // Since objects rotate/scale, World Pos is cooler for a "projection" effect
+    // But user asked for grid ON obstacles.
+    
+    // Simple Modulo Grid
+    float gx = step(1.0 - lineWidth, fract(vWorldPosition.x * 2.0));
+    float gz = step(1.0 - lineWidth, fract(vWorldPosition.z * 2.0));
+    float grid = max(gx, gz);
+    
+    // Add a pulsing glow
+    float pulse = 0.5 + 0.5 * sin(vWorldPosition.y * 10.0 - 2.0); // No time var yet easily accessible without updateloop
+    
+    // Mix with base color
+    vec3 gridColor = vec3(0.0, 0.8, 1.0) * 2.0; // Cyan glow
+    
+    if (grid > 0.5) {
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, gridColor, 0.5);
+        gl_FragColor.rgb += gridColor * 0.2; // Addative bloom
+    }
+    `
+  )
+}
 
 for (let i = 0; i < config.obstacleCount; i++) {
   const obs = new THREE.Mesh(obstacleGeometry, obstacleMaterial.clone())
@@ -453,8 +516,8 @@ sceneFolder.add(config, 'poleOpacity', 0, 1).name('Pole Opacity').onChange((v: n
   poleMaterial.opacity = v
 })
 sceneFolder.addColor(config, 'particleColor').name('Particles').onChange((c: string) => {
-  particleMaterial.color.set(c)
-  particleMaterial.emissive.set(c)
+  headMaterial.color.set(c)
+  bodyMaterial.color.set(c)
 })
 sceneFolder.add(config, 'bloomStrength', 0, 0.2).onChange((v: number) => bloomPass.strength = v)
 sceneFolder.add(config, 'bloomRadius', 0, 1).onChange((v: number) => bloomPass.radius = v)
@@ -551,33 +614,6 @@ function animate() {
     const minR = config.poleRadius + r1
     const maxR = config.platformRadius - r1
 
-    // 0. Static Obstacles (skip for leaving particles)
-    if (state !== STATE_LEAVING) {
-      for (let k = 0; k < config.obstacleCount; k++) {
-        const ox = obstacleData[k * 3]
-        const oz = obstacleData[k * 3 + 1]
-        const or = obstacleData[k * 3 + 2]
-
-        const dx = x - ox
-        const dz = z - oz
-        const dSq = dx * dx + dz * dz
-
-        const minDist = r1 + or
-        if (dSq < minDist * minDist) {
-          const d = Math.sqrt(dSq)
-          const pen = minDist - d
-          const nx = dx / d
-          const nz = dz / d
-
-          const pushFactor = 0.2
-          x += nx * pen * pushFactor
-          z += nz * pen * pushFactor
-
-          vx *= 0.5
-          vz *= 0.5
-        }
-      }
-    }
 
     // 1. Neighbor Physics
     let sepX = 0
@@ -655,9 +691,9 @@ function animate() {
       const tx = -z / dist
       const tz = x / dist
 
-      // Dynamic Flow
+      // Dynamic Flow - only spiral when very close to pole
       let spiralDesire = 0.0
-      if (dist < 2.5) spiralDesire = 1.0
+      if (dist < 1.2) spiralDesire = 1.0  // Reduced from 2.5 to allow particles to reach pole
       if (localDensity > 2) spiralDesire = Math.max(spiralDesire, Math.min(1.0, (localDensity - 2) * 0.3))
 
       let dx = tx * spiralDesire + rx * (1.0 - spiralDesire * 0.5)
@@ -695,8 +731,8 @@ function animate() {
         vz -= (z / dist) * config.centrifugalForce * 0.1
       }
 
-      // Touch Check
-      if (dist < config.poleRadius + r1 + 0.1) {
+      // Touch Check - particles must actually touch the pole to start orbiting
+      if (dist < config.poleRadius + r1) {
         state = STATE_ORBITING
         particles[i * STRIDE + 7] = STATE_ORBITING
         particles[i * STRIDE + 8] = 0 // Reset angle accumulator
@@ -710,16 +746,38 @@ function animate() {
         vz = tangZ * orbitSpeed
       }
 
-      // Boundaries (only for seeking)
+      // Inner boundary only - prevent particles from going through the pole
       if (dist < minR) {
         const angle = Math.atan2(z, x)
         x = Math.cos(angle) * minR
         z = Math.sin(angle) * minR
       }
+
+      // Outer boundary - prevent particles from leaving the platform
       if (dist > maxR) {
         const angle = Math.atan2(z, x)
         x = Math.cos(angle) * maxR
         z = Math.sin(angle) * maxR
+
+        // If moving outward, cancel that component and push inward STRONGLY
+        const rx = x / dist
+        const rz = z / dist
+        const vDotR = vx * rx + vz * rz
+
+        if (vDotR > 0) {
+          vx -= rx * vDotR // Kill outward velocity
+          vz -= rz * vDotR
+
+          // Stronger inward bounce to overcome separation forces
+          vx -= rx * 0.05
+          vz -= rz * 0.05
+        }
+      } else if (dist > config.platformRadius * 0.9) {
+        // Soft Edge Repulsion: If very close to edge, add extra inward desire
+        const rx = x / dist
+        const rz = z / dist
+        vx -= rx * 0.01
+        vz -= rz * 0.01
       }
 
     } else if (state === STATE_ORBITING) {
@@ -749,59 +807,92 @@ function animate() {
       acc += dAngle
       particles[i * STRIDE + 8] = acc
 
-      // Color Graduation (Only Changes Head)
-      const progress = Math.min(1.0, acc / (Math.PI * 2))
-      const baseHex = particles[i * STRIDE + 9]
-      _baseColor.setHex(baseHex)
-      _color.lerpColors(_baseColor, _targetColor, progress)
-      headMesh.setColorAt(i, _color)
+      // Color graduation removed - particles keep original colors
 
-      // Transition to leaving after one full orbit
-      if (acc > Math.PI * 2) {
+      // After 3 complete orbits, particle loses interest and starts drifting away
+      if (acc > Math.PI * 2 * 3) {
         state = STATE_LEAVING
         particles[i * STRIDE + 7] = STATE_LEAVING
-        // Reset velocity to purely radial (outward) direction
-        const radialSpeed = 0.08
-        vx = rx * radialSpeed
-        vz = rz * radialSpeed
-      }
-
-    } else if (state === STATE_LEAVING) {
-      // LEAVING BEHAVIOR - drift away and fade out
-      if (dist > 0.01) {
+        // Set gentle outward velocity
         const rx = x / dist
         const rz = z / dist
-        // Gentle outward acceleration for controlled drift
-        vx += rx * 0.05
-        vz += rz * 0.05
-        // Light friction for smooth drift
-        vx *= 0.99
-        vz *= 0.99
+        vx = rx * 0.03
+        vz = rz * 0.03
       }
+      // Transition to leaving after one full orbit - DISABLED
+      // Particles now orbit indefinitely without leaving
+    } else if (state === STATE_LEAVING) {
+      // Safety check: if in LEAVING state but haven't completed 3 orbits, reset to seeking
+      const acc = particles[i * STRIDE + 8]
+      if (acc < Math.PI * 2 * 3) {
+        state = STATE_SEEKING
+        particles[i * STRIDE + 7] = STATE_SEEKING
+        particles[i * STRIDE + 8] = 0
+      } else {
+        // LEAVING BEHAVIOR - slowly drift away after orbiting
+        if (dist > 0.01) {
+          const rx = x / dist
+          const rz = z / dist
+          // Very gentle outward acceleration
+          vx += rx * 0.01
+          vz += rz * 0.01
+          // Light friction
+          vx *= 0.98
+          vz *= 0.98
+        }
 
-      // Slow shrink effect so particles stay visible longer
-      r1 *= 0.985
-      particles[i * STRIDE + 4] = r1
-
-      // Respawn if vanished or drifted far away
-      if (r1 < 0.001 || dist > config.platformRadius * 1.8) {
-        initParticle(i)
-        continue
+        // Respawn only when drifted far away (check after position update)
+        const currentDist = Math.sqrt(x * x + z * z)
+        if (currentDist > config.platformRadius * 1.5) {
+          initParticle(i)
+          continue
+        }
       }
     }
 
-    // Speed limit (but not for leaving particles - they need to escape!)
-    if (state !== STATE_LEAVING) {
-      const speedLimit = config.speed * 1.5 * mySpeedMult
-      const currentVel = Math.sqrt(vx * vx + vz * vz)
-      if (currentVel > speedLimit) {
-        vx = (vx / currentVel) * speedLimit
-        vz = (vz / currentVel) * speedLimit
-      }
+    // Speed limit for all particles
+    const speedLimit = config.speed * 1.5 * mySpeedMult
+    const currentVel = Math.sqrt(vx * vx + vz * vz)
+    if (currentVel > speedLimit) {
+      vx = (vx / currentVel) * speedLimit
+      vz = (vz / currentVel) * speedLimit
     }
 
     x += vx * dt
     z += vz * dt
+
+    // Post-Integration Static Obstacles (Strict Constraint)
+    if (state !== STATE_LEAVING) {
+      for (let k = 0; k < config.obstacleCount; k++) {
+        const ox = obstacleData[k * 3]
+        const oz = obstacleData[k * 3 + 1]
+        // Radius Correction: Scale * (Base 1.0 + Bevel 0.1) + Buffer ~0.05
+        const or = obstacleData[k * 3 + 2] * 1.15
+
+        const dx = x - ox
+        const dz = z - oz
+        const dSq = dx * dx + dz * dz
+
+        const minDist = r1 + or
+        if (dSq < minDist * minDist) {
+          const d = Math.sqrt(dSq)
+          const pen = minDist - d
+          const nx = dx / d
+          const nz = dz / d
+
+          // Hard resolve 100%
+          x += nx * pen
+          z += nz * pen
+
+          // Deflect velocity
+          const vDotN = vx * nx + vz * nz
+          if (vDotN < 0) {
+            vx -= nx * vDotN
+            vz -= nz * vDotN
+          }
+        }
+      }
+    }
 
     particles[i * STRIDE] = x
     particles[i * STRIDE + 1] = z
