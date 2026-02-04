@@ -381,9 +381,7 @@ for (let i = 0; i < config.obstacleCount; i++) {
 // --- Logic Helpers ---
 const dummy = new THREE.Object3D()
 const _color = new THREE.Color()
-const _white = new THREE.Color(0xffffff)
 const _targetColor = new THREE.Color()
-const _baseColor = new THREE.Color()
 
 // Updated Palette: Black, Yellow, White tones
 const palette = [
@@ -560,7 +558,7 @@ window.addEventListener('resize', () => {
 })
 
 // --- Animation Loop ---
-let lastSpawnTime = 0
+// --- Animation Loop ---
 const TARGET_POPULATION = 15000
 
 function animate() {
