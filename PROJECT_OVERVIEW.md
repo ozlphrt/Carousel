@@ -14,7 +14,7 @@ Interactive Three.js simulation of crowd flow around a central pole with emergen
 - GUI controls for visual and physics tuning
 
 ## External URL
-GitHub Pages deploys automatically on push to `main`.
+- https://ozlphrt.github.io/Carousel/
 
 ## Tech Stack
 - Three.js
